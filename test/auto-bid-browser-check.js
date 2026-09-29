@@ -1,0 +1,62 @@
+async page => {
+    const check = (pass, message) => { if (!pass) throw new Error(message); };
+    await page.setViewportSize({width:1100,height:900});
+    await page.evaluate(() => localStorage.removeItem('fsu-demo-state'));
+    await page.reload();
+    const start = page.getByRole('button', { name: '开始 / 继续参考名单购买' });
+    check(await page.evaluate(()=>sim.calls.length===0),'page load must not request or buy');
+    await page.getByRole('combobox', {name:'参考名单更新间隔：'}).selectOption('2');
+    check(await page.evaluate(()=>info.autoBid.runner.c.priceTtlMs===7200000),'two-hour option must persist');
+    await start.click();
+    await page.waitForFunction(() => info.autoBid.runner.mode === 'running' && !info.autoBid.starting);
+    await page.evaluate(() => advance(20));
+    const running = await page.evaluate(() => ({ mode:info.autoBid.runner.mode, stats:info.autoBid.runner.stats,
+        calls:sim.calls, records:[...info.autoBid.runner.records.values()].map(r=>r.state) }));
+    check(running.stats.bids === 1 && running.stats.buys === 1 && running.stats.won === 1, 'bid stays pending; buy must be server-confirmed');
+    check(running.records.includes('leading'), 'leading state must be visible');
+    check(running.calls.every((c,i,a)=>!i||c.at-a[i-1].at>=2000), 'request gap must be >=2s');
+    await page.getByText('关注中的拍卖与运行记录', { exact:true }).click();
+    await page.screenshot({ path:'.reference/auto-bid-running.png' });
+    const other = await page.context().newPage();
+    await other.goto('http://127.0.0.1:8766/test/auto-bid-harness.html');
+    await other.getByRole('button', {name:'开始 / 继续参考名单购买'}).click();
+    await other.waitForFunction(() => info.autoBid.runner.mode === 'paused');
+    check((await other.evaluate(()=>info.autoBid.runner.message)).includes('另一个标签页'), 'second tab must not bid');
+    check(await other.evaluate(()=>sim.calls.length===0), 'second tab must not make requests');
+    await other.close();
+    await page.getByRole('button', {name:'暂停',exact:true}).click();
+    const count = await page.evaluate(()=>sim.calls.length);
+    await page.evaluate(()=>advance(10));
+    check(await page.evaluate(()=>sim.calls.length)===count,'pause must stop every request');
+    await start.click();
+    await page.waitForFunction(()=>info.autoBid.runner.mode==='running'&&!info.autoBid.starting);
+    await page.evaluate(()=>advance(3));
+    await page.getByRole('button',{name:'停止',exact:true}).click();
+    check(await page.evaluate(()=>info.autoBid.runner.mode)==='stopped','stop must remain stopped');
+    await page.setViewportSize({width:390,height:844});
+    await page.getByText('当前模式完整名单与逐卡 PC 参考价',{exact:true}).click();
+    await page.screenshot({path:'.reference/auto-bid-mobile.png'});
+    check(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'mobile UI must not overflow horizontally');
+    await start.click();
+    await page.waitForFunction(()=>info.autoBid.runner.mode==='running'&&!info.autoBid.starting);
+    await page.evaluate(()=>{document.querySelector('#hub').style.display='none';});
+    await page.waitForFunction(()=>info.autoBid.runner.mode==='paused');
+    check((await page.evaluate(()=>info.autoBid.runner.message)).includes('离开转会中心'),'hidden hub must pause');
+    await page.evaluate(()=>{document.querySelector('#hub').style.display='';});
+    const historyPage = await page.context().newPage();
+    await historyPage.goto('http://127.0.0.1:8766/test/auto-bid-harness.html');
+    check(await historyPage.evaluate(()=>sim.calls.length===0),'recent search must not auto-start');
+    const historyChoice = historyPage.getByRole('combobox').first();
+    check((await historyChoice.locator('option').allTextContents()).some(t=>t.includes('模拟球员')),
+        'FSU recent search must be visible');
+    await historyChoice.selectOption('0');
+    await historyPage.getByRole('button',{name:'按所选搜索买一张'}).click();
+    await historyPage.waitForFunction(()=>info.autoBid.runner.mode==='running'&&!info.autoBid.starting);
+    await historyPage.evaluate(()=>advance(10));
+    const historyRun=await historyPage.evaluate(()=>({mode:info.autoBid.runner.mode,calls:sim.calls,stats:info.autoBid.runner.stats}));
+    check(historyRun.mode==='stopped'&&historyRun.stats.won===1,'recent search stops after one confirmed buy');
+    check(historyRun.calls.filter(c=>c.name==='buy').length===1&&
+        historyRun.calls.filter(c=>c.name==='bid').length===0,'recent search submits exactly one BIN');
+    await historyPage.close();
+    return {passed:true,checks:['no auto-start','two-hour setting','start','bid and long-lived BIN','server confirmation','2-second gap','cross-tab lock','pause','resume','stop','mobile width','recent search one-buy stop'],stats:running.stats};
+}

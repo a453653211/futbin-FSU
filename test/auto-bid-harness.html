@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FSU 市场购买 · 本地模拟</title><link rel="icon" href="data:,">
+<style>body{margin:0;background:#10151d;color:#eaf0f5;font:15px/1.5 system-ui,sans-serif}main{max-width:940px;margin:24px auto;padding:0 16px}h1{font-size:22px}h2{font-size:20px;margin:0 0 8px}p{margin:8px 0}button{border:0;border-radius:5px;padding:10px 18px;background:#384353;color:#fff;cursor:pointer}button.call-to-action{background:#b0e763;color:#16230c}button:disabled{opacity:.4;cursor:default}summary{cursor:pointer;margin-top:14px}.tiles{display:flex;gap:14px}.tiles>div{flex:1;background:#283243;padding:24px}pre{font-family:inherit}</style>
+<main><h1>转会中心</h1><p>本地模拟环境 · 不连接 EA，不会实际花费金币</p><div id="hub"><div class="tiles"><div>搜索转会市场</div><div>转会名单</div><div>转会目标</div></div></div></main>
+<script>
+window.info={base:{year:27,platform:'pc'},futbinId:{},roster:{data:{}},market:{mb:[],ts:Date.now()}};
+window.events={};window.sim={now:Date.now(),coins:100000,calls:[],items:[]};
+window.SearchType={PLAYER:'player'};
+window.UTSearchCriteriaDTO=class {constructor(){Object.assign(this,{_type:'player',maskedDefId:0,defId:[],minBuy:0,maxBuy:0,minBid:0,maxBid:0,league:-1,nation:-1,count:20,offset:0});}get type(){return this._type;}};
+window.repositories={Item:{getStaticDataByDefId:()=>({name:'模拟球员'})}};
+const recentCriteria=new UTSearchCriteriaDTO();recentCriteria.maskedDefId=101;recentCriteria.maxBuy=20000;
+info.market.mb=[Object.values(recentCriteria)];
+window.UTTransfersHubView=function(){};UTTransfersHubView.prototype.init=function(){};
+UTTransfersHubView.prototype.getRootElement=()=>document.querySelector('#hub');
+window.UTStandardButtonControl=function(){};
+events.createButton=(instance,text,fn,classes)=>{
+ const root=document.createElement('button');root.textContent=text;root.className=classes;root.onclick=()=>fn(instance);
+ instance.getRootElement=()=>root;instance.setInteractionState=state=>{root.disabled=!state;};return instance;
+};
+window.GM_setValue=(key,value)=>localStorage.setItem(key,value);
+window.GM_getValue=(key,fallback)=>localStorage.getItem(key)||fallback;
+</script>
+<script src="../src/market-catalog.js"></script><script src="../src/auto-bid-core.js"></script><script src="../src/auto-bid-integration.js"></script>
+<script>
+events.autoBidAdapter=()=>{
+ const scope='sim:27:pc';
+ const p={defId:101,rating:87,position:25,gk:0,player:true,gold:true,special:false,name:'模拟球员 · 87 金卡'};
+ const a={tradeId:'123',seconds:55,current:0,start:750,buy:100000,valid:true,active:true,highest:false,stale:false};
+ const item={...p,auction:a};sim.item=item;
+ const buyItem={...p,auction:{...a,tradeId:'124',seconds:3600,start:20000,buy:20000}};
+ const snapshot=()=>({version:1,scope,year:27,platform:'pc',complete:true,total:1,pages:1,
+  fetchedAt:Date.now(),source:'https://www.futbin.com/27/players',rows:[{...p,value:40000,futbinId:1,
+  source:'https://www.futbin.com/27/player/1/test',sourceAt:Date.now(),sourceCheckedRaw:'2026-09-20 02:30:00'}]});
+ const call=name=>sim.calls.push({name,at:sim.now});
+ return {scope:()=>scope,session:()=>scope,check:()=>{},coins:()=>sim.coins,player:i=>i,auction:i=>i.auction,
+ floor:n=>FsuAutoBid.floorPrice(n,[{min:100000,inc:1000},{min:50000,inc:500},{min:10000,inc:250},{min:1000,inc:100},{min:150,inc:50}]),
+ next:n=>n+50,canBid:(i,n,c)=>n<=c&&n<i.auction.buy,canBuy:(i,c)=>c>=i.auction.buy,
+ currencies:async()=>call('coins'),watched:async()=>{call('watched');return sim.items;},
+ loadCatalog:()=>snapshot(),saveCatalog:s=>GM_setValue('fsu-demo-catalog',JSON.stringify(s)),
+ catalogPage:async()=>{call('catalog');return{year:27,platform:'pc',page:1,pages:1,total:1,at:Date.now(),source:snapshot().source,items:snapshot().rows};},
+ search:async(p,cap,kind)=>{call('search');return{items:kind==='buy'?[buyItem]:[item],end:true};},
+ refresh:async items=>{call('refresh');return items.map(i=>i.auction.tradeId);},
+ bid:async(i,n)=>{call('bid');sim.items.push(item);a.current=n;a.highest=true;a.seconds=30;sim.coins-=n;},
+ buy:async(i,n)=>{call('buy');sim.items.push(i);i.auction.current=n;i.auction.bought=true;i.auction.won=true;i.auction.closed=true;i.auction.active=false;sim.coins-=n;},
+ save:data=>GM_setValue('fsu-demo-state',JSON.stringify(data)),
+ load:()=>JSON.parse(GM_getValue('fsu-demo-state','null'))};
+};
+new UTTransfersHubView().init();info.autoBid.runner.now=()=>sim.now;
+window.advance=async(count=1)=>{for(let i=0;i<count;i++){sim.now+=2000;await info.autoBid.runner.tick();}};
+</script></html>
