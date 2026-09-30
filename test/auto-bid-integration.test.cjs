@@ -151,6 +151,16 @@ test('PC platform must agree with selected persona SKU and current FC27 season',
     f.ctx.info.base.platform='pc';f.user.getSelectedPersona().sku='ps27';assert.throws(()=>f.adapter.check(),/PC/);
     f.user.getSelectedPersona().sku='pc27';f.ctx.info.base.year=26;assert.throws(()=>f.adapter.check(),/赛季/);
 });
+test('EA Steam persona uses the PC market and remains isolated by its own SKU',()=>{
+    assert.match(ea,/case GameSku\['PC'\]:case GameSku\.STEAM:return GamePlatform\['PC'\]/);
+    const f=setup();f.ctx.GameSku.STEAM='steam27';
+    const pcScope=f.adapter.scope();
+    f.user.getSelectedPersona().sku=f.ctx.GameSku.STEAM;
+    assert.equal(f.ctx.info.base.platform,'pc');
+    assert.doesNotThrow(()=>f.adapter.check());
+    assert.notEqual(f.adapter.scope(),pcScope);
+    f.ctx.info.base.platform='ps';assert.throws(()=>f.adapter.check(),/PC/);
+});
 test('candidate list requests gold quality and pagination; position/rating filtering stays local',async()=>{
     const f=setup();await f.adapter.discover(200);const c=f.calls[0][1];
     assert.equal(c.level,'gold');assert.equal(c.zone,undefined);assert.equal(c.offset,200);assert.equal(c.count,200);

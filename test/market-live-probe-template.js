@@ -6,7 +6,7 @@ async page => {
         // Source strings are inserted from the current production files by the local
         // installer. No scheduler is started and no prototype/UI hooks are installed.
         const create = new Function('GM_setValue', 'GM_getValue',
-            'const module=undefined; const info={base:{year:APP_YEAR_SHORT,platform:services.User.getUser().getSelectedPersona().sku===GameSku.PC?"pc":"other"}};const events={};\n' +
+            'const module=undefined; const sku=services.User.getUser().getSelectedPersona().sku;const info={base:{year:APP_YEAR_SHORT,platform:sku===GameSku.PC||sku===GameSku.STEAM?"pc":"other"}};const events={};\n' +
             catalogSource + '\n' + coreSource + '\n' + adapterSource + '\nreturn {adapter:events.autoBidAdapter(),observe:events.autoBidObserve};');
         const {adapter:a,observe} = create((k,v)=>sessionStorage.setItem(k,v),(k,d)=>sessionStorage.getItem(k)||d);
         a.check();const scope=a.scope();

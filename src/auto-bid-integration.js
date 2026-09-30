@@ -76,8 +76,9 @@ events.autoBidAdapter = () => {
         check() {
             if (info.autoBidTainted) throw Object.assign(new Error('上次请求结果不确定，请刷新网页后继续'), { fatal: true });
             if (Number(info.base.year) !== 27 || Number(APP_YEAR_SHORT) !== 27) throw Object.assign(new Error('赛季必须是 FC27，请刷新网页'), { fatal: true });
-            if (info.base.platform !== 'pc' || services.User.getUser()?.getSelectedPersona?.()?.sku !== GameSku.PC)
-                throw Object.assign(new Error('本功能只使用 FC27 PC 市场；账号平台与 PC 不一致'), { fatal: true });
+            const personaSku = services.User.getUser()?.getSelectedPersona?.()?.sku;
+            if (info.base.platform !== 'pc' || (personaSku !== GameSku.PC && personaSku !== GameSku.STEAM))
+                throw Object.assign(new Error('本功能只使用 FC27 PC（含 Steam）市场；账号平台与 PC 市场不一致'), { fatal: true });
             if (services.User.getUser()?.tradeAccess !== TradeAccessLevel.ALLOWED)
                 throw Object.assign(new Error('当前账号没有转会市场访问权限'), { fatal: true });
             for (const name of ['searchConceptItems', 'searchTransferMarket', 'bid', 'requestWatchedItems'])
