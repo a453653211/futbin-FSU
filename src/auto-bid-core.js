@@ -71,6 +71,8 @@ const FsuAutoBid = (() => {
             this.authWaitSince = null;
             this.catalog = null; this.builder = null; this.scan = new Map(); this.searchTurn = 0;
             this.strategy = 'catalog'; this.history = null; this.historyKey = null;
+            this.historyPlan = []; this.historyKeys = []; this.historyDone = new Set();
+            this.historyIndex = 0; this.historyProgressActive = false;
             this.owned = new Map();
             this.catalogRefreshMs = this.c.priceTtlMs;
         }
@@ -140,6 +142,9 @@ const FsuAutoBid = (() => {
         changed() { this.onChange(this); }
         snapshot() {
             return { version: 2, scope: this.scope, strategy: this.strategy, cycleEnd: this.cycleEnd, restUntil: this.restUntil,
+                historyProgress: this.strategy === 'history' ? {
+                    keys: this.historyKeys, done: [...this.historyDone], active: this.historyProgressActive
+                } : null,
                 nextAt: this.nextAt, pending: [...this.recovered, ...[...this.records.values()].filter(r => r.submitted && !terminal.has(r.state))
                     .map(r => ({ tradeId: r.tradeId, defId: r.defId, cap: r.cap, lastBid: r.lastBid || 0,
                         name: r.name, kind: r.kind || 'bid', custom: r.custom === true, gallery: r.gallery === true,
@@ -156,6 +161,28 @@ const FsuAutoBid = (() => {
             this.a.check();
             const scope = this.a.scope();
             if (this.scope && scope !== this.scope) throw new Error('账户或平台已改变，请刷新网页后启动。');
+            const selected = history === null ? null : Array.isArray(history) ? history : [history];
+            if (selected && (selected.length < 1 || selected.length > 6))
+                throw new Error('请选择一至六条最近搜索条件');
+            const selectedKeys = selected?.map(row => {
+                if (!row || !Number.isSafeInteger(row.maskedDefId) || row.maskedDefId <= 0 ||
+                    row.maskedDefId > 0xffffff || typeof row.name !== 'string' || !row.name.trim() ||
+                    !row.criteria || !Number.isSafeInteger(row.criteria.maskedDefId) ||
+                    (row.criteria.maskedDefId & 0xffffff) !== row.maskedDefId ||
+                    row.criteria.maxBuy !== row.limit || historyCap(row.limit, this.a) < 150)
+                    throw new Error('最近搜索条件或一口价最高价无效');
+                return JSON.stringify(row.criteria);
+            });
+            if (selectedKeys && new Set(selectedKeys).size !== selectedKeys.length)
+                throw new Error('所选最近搜索包含重复条件，请只选其中一条');
+            const valid = [1, 2].includes(saved?.version) && saved.scope === scope;
+            const progress = valid && saved.historyProgress;
+            const resume = selectedKeys && progress?.active === true;
+            if (resume && (!Array.isArray(progress.keys) || !Array.isArray(progress.done) ||
+                new Set(progress.keys).size !== progress.keys.length ||
+                progress.keys.length !== selectedKeys.length || !progress.keys.every(key => selectedKeys.includes(key)) ||
+                !progress.done.every(key => selectedKeys.includes(key))))
+                throw new Error('已有未完成的最近搜索任务；请勾选同一组条件继续，或先停止旧任务');
             this.scope = scope; this.session = this.a.session(); this.authWaitSince = null; this.revision++;
             const previousStrategy = this.strategy;
             this.strategy = gallery ? 'gallery' : history === null ? 'catalog' : 'history';
@@ -166,22 +193,22 @@ const FsuAutoBid = (() => {
             this.c.priceTtlMs = gallery ? Catalog.HOUR : this.catalogRefreshMs;
             if (gallery) this.loadOwned();
             if (this.strategy === 'history') {
-                if (!history || !Number.isSafeInteger(history.maskedDefId) || history.maskedDefId <= 0 ||
-                    history.maskedDefId > 0xffffff || typeof history.name !== 'string' || !history.name.trim() ||
-                    !history.criteria || !Number.isSafeInteger(history.criteria.maskedDefId) ||
-                    (history.criteria.maskedDefId & 0xffffff) !== history.maskedDefId ||
-                    history.criteria.maxBuy !== history.limit || historyCap(history.limit, this.a) < 150)
-                    throw new Error('最近搜索条件或一口价最高价无效');
-                this.history = history;
-                this.historyKey = JSON.stringify(history.criteria);
-            } else { this.history = null; this.historyKey = null; }
+                this.historyPlan = selected; this.historyKeys = selectedKeys;
+                this.historyDone = new Set(resume ? progress.done : []);
+                this.historyIndex = selectedKeys.findIndex(key => !this.historyDone.has(key));
+                if (this.historyIndex < 0) throw new Error('所选最近搜索已全部完成，请停止旧任务后重新启动');
+                this.history = selected[this.historyIndex]; this.historyKey = selectedKeys[this.historyIndex];
+                this.historyProgressActive = true;
+            } else {
+                this.history = null; this.historyKey = null; this.historyPlan = []; this.historyKeys = [];
+                this.historyDone = new Set(); this.historyIndex = 0; this.historyProgressActive = false;
+            }
             if (previousStrategy !== this.strategy) { this.cycleEnd = 0; this.restUntil = 0; }
             for (const r of this.active()) if (Boolean(r.custom) !== (this.strategy === 'history') ||
                 Boolean(r.gallery) !== gallery) {
                 if (r.submitted) r.readOnly = true;
                 else this.finish(r, 'skipped');
             }
-            const valid = [1, 2].includes(saved?.version) && saved.scope === scope;
             if (valid && !this.records.size) this.recovered = (saved.pending || []).filter(r =>
                 /^\d+$/.test(r.tradeId) && Number.isInteger(r.defId) && r.defId > 0 &&
                 Number.isFinite(r.cap) && r.cap >= 150 && Number.isFinite(r.lastBid) && r.lastBid >= 0)
@@ -191,9 +218,10 @@ const FsuAutoBid = (() => {
             if (this.strategy === 'history') for (const r of [...this.active(), ...this.recovered]) {
                 if (!r.custom) continue;
                 // An older manual-list purchase cannot silently join the selected search.
-                if (r.historyKey !== this.historyKey || (r.defId & 0xffffff) !== this.history.maskedDefId ||
-                    r.kind !== 'buy') r.readOnly = true;
-                r.cap = Math.min(r.cap, historyCap(this.history.limit, this.a));
+                const matching = this.historyPlan.find(row => JSON.stringify(row.criteria) === r.historyKey &&
+                    row.maskedDefId === (r.defId & 0xffffff));
+                if (!matching || r.kind !== 'buy') r.readOnly = true;
+                if (matching) r.cap = Math.min(r.cap, historyCap(matching.limit, this.a));
             }
             const kind = gallery ? 'gallery' : 'catalog';
             const cached = this.catalog && (this.catalog.kind || 'catalog') === kind ?
@@ -201,7 +229,8 @@ const FsuAutoBid = (() => {
             // Preserve the census even when its prices are too old for trading.
             if (cached?.scope === scope && (cached.kind || 'catalog') === kind) this.previousCatalog = cached;
             if (this.strategy === 'history') {
-                this.catalog = null; this.players = [this.history]; this.quotes.clear();
+                this.catalog = null; this.players = this.historyPlan.filter((row, i) => !this.historyDone.has(this.historyKeys[i]));
+                this.quotes.clear();
                 this.scan.clear(); this.searchTurn = 0;
             } else if (Catalog.valid(cached, scope, this.now(), this.c.priceTtlMs, kind)) this.useCatalog(cached);
             else { this.catalog = null; this.players = []; this.quotes.clear(); }
@@ -223,15 +252,15 @@ const FsuAutoBid = (() => {
                 this.nextAt = Math.max(this.nextAt, saved.nextAt > now && saved.nextAt <= now + this.c.intervalMs ? saved.nextAt : 0);
             }
             if (this.strategy === 'history' && [...this.records.values()].some(r => r.custom &&
-                r.state === 'unresolved' && (r.historyKey === this.historyKey ||
-                    (r.defId & 0xffffff) === this.history.maskedDefId)))
+                r.state === 'unresolved' && (this.historyKeys.includes(r.historyKey) ||
+                    this.historyPlan.some(row => (r.defId & 0xffffff) === row.maskedDefId))))
                 throw new Error('这名球员有结果不明的旧交易；请核对转会目标，确认未成交后再解除阻塞');
             if (this.strategy === 'history' || referenceOnly) { this.restUntil = 0; this.cycleEnd = Infinity; }
             else if (!Number.isFinite(this.cycleEnd) || !this.cycleEnd ||
                 (now >= this.cycleEnd + this.c.restMs)) this.cycleEnd = now + this.c.runMs;
             this.mode = 'running'; this.message = '读取金币并核对已有竞拍'; this.needRecovery = true;
             this.currencyAt = -Infinity; this.pendingBid = null; this.failures = 0;
-            this.log(this.strategy === 'history' ? `已启动最近搜索：${this.history.name}，一口价不超过 ${this.history.limit}，确认一张后停止` :
+            this.log(this.strategy === 'history' ? `已启动 ${this.historyPlan.length} 条最近搜索，轮流查询未完成条件；每条确认一张后移出轮询` :
                 gallery ? '已启动收藏馆购买：四个联赛 85+ 基础金卡，逐卡最多一张，严格低于 PC 参考价 70%' :
                 '已启动：FC27 基础金卡、87+ 非门将、PC 参考价 ≥40,000，严格低于 70% 竞拍或一口价');
             this.save(); this.changed(); return true;
@@ -242,7 +271,11 @@ const FsuAutoBid = (() => {
             try { this.save(); } catch { this.message += '（无法保存记录，请在转会目标核对）'; }
             this.changed();
         }
-        stop() { this.pause('已停止；已提交的报价仍然有效，结果可在转会目标查看'); this.mode = 'stopped'; this.changed(); }
+        stop() {
+            this.historyProgressActive = false;
+            this.pause('已停止；已提交的报价仍然有效，结果可在转会目标查看');
+            this.mode = 'stopped'; this.changed();
+        }
         active() { return [...this.records.values()].filter(r => !terminal.has(r.state)); }
         finish(r, state) {
             if (terminal.has(r.state)) return;
@@ -259,8 +292,25 @@ const FsuAutoBid = (() => {
                 const price = r.kind === 'buy' ? r.lastBid : this.a.auction(r.item).current;
                 this.stats.won++; this.stats.spent += price;
                 this.log(`已确认成交：${r.name}，${price.toLocaleString()} 金币（在转会目标领取）`);
-                if (this.strategy === 'history' && r.custom && r.historyKey === this.historyKey) {
-                    this.mode = 'stopped'; this.message = '已买到一张，最近搜索任务结束';
+                if (this.strategy === 'history' && r.custom && this.historyKeys.includes(r.historyKey) &&
+                    !this.historyDone.has(r.historyKey)) {
+                    this.historyDone.add(r.historyKey);
+                    for (const other of this.active()) if (other !== r && other.custom &&
+                        other.historyKey === r.historyKey && !other.submitted) {
+                        other.state = 'skipped'; this.stats.skipped++;
+                    }
+                    this.pendingBid = null;
+                    this.historyIndex = this.historyKeys.findIndex(key => !this.historyDone.has(key));
+                    if (this.historyIndex < 0) {
+                        this.historyProgressActive = false;
+                        this.mode = 'stopped'; this.message = `已完成 ${this.historyPlan.length} 条最近搜索，每条买到一张`;
+                    } else {
+                        this.history = this.historyPlan[this.historyIndex]; this.historyKey = this.historyKeys[this.historyIndex];
+                        this.players = this.historyPlan.filter((row, i) => !this.historyDone.has(this.historyKeys[i]));
+                        this.scan.clear(); this.searchTurn = 0;
+                        this.message = `已完成 ${this.historyDone.size} / ${this.historyPlan.length} 条，继续轮询其余条件`;
+                        this.log(this.message);
+                    }
                 }
             } else if (state === 'lost') this.log(`竞拍结束：${r.name}，未中标`);
             else if (state === 'unresolved') {
@@ -268,7 +318,8 @@ const FsuAutoBid = (() => {
                 this.log(`无法确认 ${r.name} 的结果，请在转会目标核对`);
             }
             else this.stats.skipped++;
-            if (this.strategy === 'history' && r.custom && r.historyKey === this.historyKey && r.submitted && state !== 'won') {
+            if (this.strategy === 'history' && r.custom && this.historyKeys.includes(r.historyKey) &&
+                r.submitted && state !== 'won') {
                 this.mode = 'stopped'; this.message = '已提交交易未确认成交，请在转会目标核对';
             }
             // Keep recent rows without growing memory for a long unattended session.
@@ -375,7 +426,12 @@ const FsuAutoBid = (() => {
                     if (item) { r.item = item; r.refreshedAt = this.now(); r.uncertain = false; }
                     else r.refreshedAt = -Infinity;
                 }
-                this.needRecovery = false; this.refreshAt = -Infinity; this.save(); return;
+                this.needRecovery = false; this.refreshAt = -Infinity; this.save();
+                if (this.strategy === 'history' && [...this.records.values()].some(r => r.custom &&
+                    r.state === 'unresolved' && (this.historyKeys.includes(r.historyKey) ||
+                        this.historyPlan.some(row => (r.defId & 0xffffff) === row.maskedDefId))))
+                    this.pause('已有最近搜索交易结果不明，请先核对转会目标');
+                return;
             }
             if (this.strategy !== 'history' && !this.draining && !Catalog.valid(this.catalog, this.scope, now,
                 this.c.priceTtlMs, this.strategy === 'gallery' ? 'gallery' : 'catalog')) {
@@ -490,13 +546,13 @@ const FsuAutoBid = (() => {
             // Alternate both search modes and rotate players after every page. A busy market
             // cannot monopolize searches. Each player/mode keeps its own page cursor.
             const kind = this.strategy === 'history' || this.searchTurn % 2 === 0 ? 'buy' : 'bid';
-            const p = affordable[Math.floor(this.searchTurn / 2) % affordable.length];
+            const p = affordable[(this.strategy === 'history' ? this.searchTurn : Math.floor(this.searchTurn / 2)) % affordable.length];
             this.searchTurn++;
             const q = this.quotes.get(p.defId);
             if (this.strategy !== 'history' && !quoteValid(q, this.scope, now, this.c)) return;
             const cap = this.strategy === 'history' ? historyCap(p.limit, this.a) : referenceCap(q.value, this.a, this.c);
             const searchCap = this.strategy === 'history' ? Math.min(cap, this.a.floor(coins)) : cap;
-            const key = (this.strategy === 'history' ? p.maskedDefId : p.defId) + ':' + kind;
+            const key = (this.strategy === 'history' ? JSON.stringify(p.criteria) : p.defId) + ':' + kind;
             const scan = this.scan.get(key) || { page: 1, seen: new Set(), rounds: 0 };
             const page = await this.request((kind === 'buy' ? '一口价全时段搜索：' : '临期竞拍搜索：') + p.name + ' · 第 ' + scan.page + ' 页 · 上限 ' + searchCap,
                 () => this.a.search(p, searchCap, kind, scan.page));
@@ -535,7 +591,7 @@ const FsuAutoBid = (() => {
                 const immediateBuy = this.strategy === 'history' && kind === 'buy';
                 const r = { item: found, tradeId: a.tradeId, defId: fp.defId, name: fp.name || p.name, cap, kind,
                     minBuy: this.strategy === 'history' ? Number(p.criteria.minBuy) || 0 : 0,
-                    historyKey: this.historyKey,
+                    historyKey: this.strategy === 'history' ? JSON.stringify(p.criteria) : null,
                     custom: this.strategy === 'history', gallery: this.strategy === 'gallery',
                     scope: this.scope, state: 'watching',
                     refreshedAt: immediateBuy ? this.now() : -Infinity, submitted: false, uncertain: false };

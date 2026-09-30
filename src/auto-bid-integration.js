@@ -192,10 +192,12 @@ events.mountAutoBid = view => {
         const node = document.createElement(tag); node.textContent = text; parent.appendChild(node); return node;
     };
     add('h2', '市场购买 · FC27 PC');
-    add('h3', '按最近搜索买一张');
-    add('p', '先在转会市场搜索球员并设置“一口价最高价”，再回到这里选择最近的一条搜索。按该条完整条件查询，买到一张后自动结束。');
-    const historySelect = add('select', '');
-    historySelect.style.cssText = 'display:block;box-sizing:border-box;width:100%;max-width:620px;margin:8px 0;padding:8px;background:#303947;color:white;border:1px solid #748391;border-radius:4px;';
+    add('h3', '按最近搜索逐条买一张');
+    add('p', '先在转会市场搜索球员并设置“一口价最高价”，再勾选最近六条中的一至六条。脚本按列表顺序轮流搜索未完成条件；每条确认买到一张后退出轮询，全部完成后自动停止。');
+    const historyChoices = add('div', '');
+    historyChoices.style.cssText = 'display:grid;gap:6px;width:100%;max-width:620px;margin:8px 0;';
+    const historySelectionStatus = add('p', '尚未选择最近搜索');
+    const historyProgressStatus = add('p', '');
     add('p', '最高一口价是包含该金额的硬上限；没有设置上限的历史记录不能启动。不使用 FUTBIN 报价、87+ 或 70% 条件。');
     add('h3', '参考名单模式');
     add('p', '87+ 基础金卡 · 排除门将 · PC 最低参考价 ≥40,000 · 买入价严格低于参考价 70%');
@@ -239,22 +241,26 @@ events.mountAutoBid = view => {
     const runner = runtime.runner;
     let displayedCatalog = null;
     let historyStamp = null;
+    const updateHistorySelectionStatus = () => {
+        const count = historyChoices.querySelectorAll('input:checked').length;
+        historySelectionStatus.textContent = count ? `已选择 ${count} 条；每条最多买一张，轮流搜索` : '尚未选择最近搜索';
+    };
     const refreshHistory = () => {
         if (historyStamp === info.market?.ts) return;
-        const previous = historySelect.value;
-        historySelect.replaceChildren();
-        const placeholder = add('option', '选择最近搜索条件', historySelect); placeholder.value = '';
+        historyChoices.replaceChildren();
         events.autoBidRecentSearches().forEach((row, index) => {
-            const option = add('option', row ? `第 ${index + 1} 条 · ${row.name} · 一口价 ${row.criteria.minBuy || '不限'}–${row.limit.toLocaleString()}` :
-                `第 ${index + 1} 条 · 条件无效或未设一口价上限`, historySelect);
-            option.value = String(index);
-            option.disabled = !row;
+            const label = add('label', '', historyChoices);
+            label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px;background:#303947;border:1px solid #748391;border-radius:4px;cursor:pointer;';
+            const checkbox = add('input', '', label); checkbox.type = 'checkbox'; checkbox.value = String(index);
+            checkbox.disabled = !row; checkbox.dataset.criteria = row ? JSON.stringify(row.criteria) : '';
+            checkbox.onchange = updateHistorySelectionStatus;
+            add('span', row ? `第 ${index + 1} 条 · ${row.name} · 一口价 ${row.criteria.minBuy || '不限'}–${row.limit.toLocaleString()}` :
+                `第 ${index + 1} 条 · 条件无效或未设一口价上限`, label);
         });
-        historySelect.value = [...historySelect.options].some(o => o.value === previous) ? previous : '';
         historyStamp = info.market?.ts;
+        updateHistorySelectionStatus();
     };
-    historySelect.onfocus = refreshHistory;
-    historySelect.onpointerdown = refreshHistory;
+    historyChoices.onpointerdown = refreshHistory;
     try {
         runtime.displayCatalog = runtime.adapter.loadCatalog();
         runtime.displayGallery = runtime.adapter.loadCatalog('gallery');
@@ -272,6 +278,8 @@ events.mountAutoBid = view => {
         buy: '准备一口价', monitoring: '仅核对结果', funds: '金币不足', won: '已成交', lost: '未成交', skipped: '已放弃', unresolved: '需手动核对' };
     const render = () => {
         refreshHistory();
+        historyProgressStatus.textContent = runner.strategy === 'history' && runner.historyPlan.length ?
+            `本次最近搜索：已完成 ${runner.historyDone.size} / ${runner.historyPlan.length} 条` : '';
         const resting = runner.mode === 'rest';
         status.textContent = `${runner.message}${resting ? ` · 剩余 ${Math.ceil(Math.max(0, runner.restUntil - Date.now()) / 1000)} 秒` : ''}`;
         stats.textContent = `候选 ${runner.players.length} · 关注 ${runner.active().length} · 竞价提交 ${runner.stats.bids} · 一口价提交 ${runner.stats.buys} · 已确认成交 ${runner.stats.won} · ${runner.stats.spent.toLocaleString()} 金币`;
@@ -323,6 +331,9 @@ events.mountAutoBid = view => {
         galleryStart.setInteractionState(!runtime.starting && !runner.busy && !['running', 'rest', 'draining'].includes(runner.mode));
         galleryUpdate.setInteractionState(!runtime.starting && !runner.busy && !['running', 'rest', 'draining'].includes(runner.mode));
         historyStart.setInteractionState(!runtime.starting && !runner.busy && !['running', 'rest', 'draining'].includes(runner.mode));
+        historyChoices.querySelectorAll('input').forEach(input => {
+            input.disabled = !input.dataset.criteria || runtime.starting || ['running', 'rest', 'draining'].includes(runner.mode);
+        });
         update.setInteractionState(!runtime.starting && !runner.busy && !['running', 'rest', 'draining'].includes(runner.mode));
         exportList.setInteractionState(!!cached);
         pause.setInteractionState(['running', 'rest', 'draining'].includes(runner.mode));
@@ -341,32 +352,47 @@ events.mountAutoBid = view => {
         await runner.tick(); releaseIfStopped(); runtime.render?.();
         if (['running', 'rest', 'draining'].includes(runner.mode)) runtime.timer = setTimeout(pump, 1000);
     };
+    const reportStartError = error => {
+        runtime.starting = false;
+        if (['running', 'rest', 'draining'].includes(runner.mode)) runner.pause(error.message);
+        else { runner.mode = 'paused'; runner.message = error.message; runner.log(error.message); }
+        render();
+    };
     const startRun = async (referenceOnly = false, useHistory = false, gallery = false) => {
         if (runtime.starting || runner.busy) return;
         runtime.starting = true; render();
         try {
-            const history = useHistory ? events.autoBidRecentSearches()[Number(historySelect.value)] : null;
-            if (useHistory && (!historySelect.value || !history))
-                throw new Error('请选择有有效一口价最高价的最近搜索');
+            refreshHistory();
+            const recent = useHistory ? events.autoBidRecentSearches() : null;
+            const history = useHistory ? [...historyChoices.querySelectorAll('input:checked')].map(input => {
+                const row = recent[Number(input.value)];
+                if (!row || JSON.stringify(row.criteria) !== input.dataset.criteria)
+                    throw new Error('最近搜索记录已改变，请重新勾选条件');
+                return row;
+            }) : null;
+            if (useHistory && !history.length)
+                throw new Error('请至少勾选一条有有效一口价最高价的最近搜索');
             if (!navigator.locks?.request) throw new Error('浏览器不支持单实例锁，请使用新版 Chrome / Edge');
             const name = `fsu-auto-bid:${runtime.adapter.scope()}`;
             // Keep the Web Lock until stopped AND the last in-flight request has finished.
             void navigator.locks.request(name, { ifAvailable: true }, async lock => {
-                if (!lock) { runtime.starting = false; runner.pause('另一个标签页正在竞拍，请先停止那一页'); render(); return; }
+                if (!lock) { reportStartError(new Error('另一个标签页正在竞拍，请先停止那一页')); return; }
                 try {
                     runtime.adapter.check();
                     const sbcPurchases = JSON.parse(GM_getValue(`fsuSbcPurchases.v1.${runtime.adapter.scope()}`, 'null'));
                     if (sbcPurchases?.records?.some(r => !['claimed', 'lost'].includes(r.state)))
                         throw new Error('SBC 补购仍有待核对交易，请先回到 SBC 规划核对领取');
                     runner.draining = false;
-                    if (!runner.start(runtime.adapter.load(), { referenceOnly, history, gallery })) return;
+                    if (!runner.start(runtime.adapter.load(), { referenceOnly, history, gallery })) {
+                        runtime.starting = false; render(); return;
+                    }
                     runtime.starting = false;
                     const held = new Promise(resolve => { runtime.release = resolve; });
                     clearTimeout(runtime.timer); runtime.timer = setTimeout(pump, 0);
                     render(); await held;
-                } catch (error) { runtime.starting = false; runner.pause(error.message); render(); }
-            }).catch(error => { runtime.starting = false; runner.pause(error.message); render(); });
-        } catch (error) { runtime.starting = false; runner.pause(error.message); render(); }
+                } catch (error) { reportStartError(error); }
+            }).catch(reportStartError);
+        } catch (error) { reportStartError(error); }
     };
     const editOwned = remove => {
         try {
@@ -393,7 +419,7 @@ events.mountAutoBid = view => {
     const start = events.createButton(new UTStandardButtonControl(), '开始 / 继续参考名单购买', () => startRun(false), 'call-to-action');
     const galleryStart = events.createButton(new UTStandardButtonControl(), '开始 / 继续收藏馆补卡', () => startRun(false, false, true), 'call-to-action');
     const galleryUpdate = events.createButton(new UTStandardButtonControl(), '仅更新收藏馆名单', () => startRun(true, false, true), '');
-    const historyStart = events.createButton(new UTStandardButtonControl(), '按所选搜索买一张', () => startRun(false, true), 'call-to-action');
+    const historyStart = events.createButton(new UTStandardButtonControl(), '按所选搜索逐条买一张', () => startRun(false, true), 'call-to-action');
     const update = events.createButton(new UTStandardButtonControl(), '仅更新名单', () => startRun(true), '');
     const exportList = events.createButton(new UTStandardButtonControl(), '导出本地名单', () => {
         const cached = runner.strategy === 'gallery' ? (runner.catalog || runtime.displayGallery) :

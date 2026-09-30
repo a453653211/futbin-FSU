@@ -20,8 +20,8 @@ source = source.replace(/new EADialogViewController\(/g, 'events.createDialog(')
 replaceOnce('        events.popup = (t,m,c,o,i,n,s) => {',
     read('src/dialog-compat.js') + '\n        events.popup = (t,m,c,o,i,n,s) => {');
 replaceOnce('        //26.04 SBC初始化需求内容',
-    read('src/sbc-solver.js').replace(/if \(typeof module[^\n]+\n?$/, '') + '\n' +
-    read('src/sbc-complex.js').replace(/if \(typeof module[^\n]+\n?$/, '') + '\n' +
+    '__FSU_SBC_SOLVER__\n' +
+    '__FSU_SBC_COMPLEX__\n' +
     read('src/sbc-procurement.js').replace(/if \(typeof module[^\n]+\n?$/, '') + '\n' +
     read('src/sbc-integration.js') + '\n' + read('src/sbc-group-integration.js') + '\n        //26.04 SBC初始化需求内容');
 const marketModules =
@@ -60,12 +60,19 @@ replaceOnce('                fsu.fillSquadBtn.addClass("mini");',
 const marker = '// ==/UserScript==';
 const afterHeader = source.indexOf(marker) + marker.length;
 if (afterHeader < marker.length) throw new Error('Missing userscript metadata');
-// Only shorten local names in our self-contained market modules. The original FSU
-// program and shared top-level names keep their spelling for compatibility.
-minify(marketModules, { compress: { passes: 2 }, mangle: true,
-    format: { comments: false } }).then(market => {
-    if (!market.code) throw new Error('Market minification returned an empty program');
-    source = source.replace('__FSU_MARKET_MODULES__', market.code);
+// Only shorten local names inside our self-contained solver and market modules.
+// The original FSU program and shared top-level names keep their spelling.
+const localMinify = code => minify(code, { compress: { passes: 2 }, mangle: true,
+    format: { comments: false } });
+Promise.all([
+    localMinify(read('src/sbc-solver.js').replace(/if \(typeof module[^\n]+\n?$/, '')),
+    localMinify(read('src/sbc-complex.js').replace(/if \(typeof module[^\n]+\n?$/, '')),
+    localMinify(marketModules)
+]).then(([solver, complex, market]) => {
+    if (!solver.code || !complex.code || !market.code) throw new Error('Module minification returned an empty program');
+    replaceOnce('__FSU_SBC_SOLVER__', solver.code);
+    replaceOnce('__FSU_SBC_COMPLEX__', complex.code);
+    replaceOnce('__FSU_MARKET_MODULES__', market.code);
     return minify(source.slice(afterHeader), { compress: { passes: 2 }, mangle: false,
     format: { comments: false, beautify: false, max_line_len: 500 } }).then(result => {
     if (!result.code) throw new Error('Terser returned an empty program');

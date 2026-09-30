@@ -46,17 +46,46 @@ async page => {
     const historyPage = await page.context().newPage();
     await historyPage.goto('http://127.0.0.1:8766/test/auto-bid-harness.html');
     check(await historyPage.evaluate(()=>sim.calls.length===0),'recent search must not auto-start');
-    const historyChoice = historyPage.getByRole('combobox').first();
-    check((await historyChoice.locator('option').allTextContents()).some(t=>t.includes('模拟球员')),
-        'FSU recent search must be visible');
-    await historyChoice.selectOption('0');
-    await historyPage.getByRole('button',{name:'按所选搜索买一张'}).click();
+    const firstHistory = historyPage.getByRole('checkbox',{name:/第 1 条/});
+    const secondHistory = historyPage.getByRole('checkbox',{name:/第 2 条/});
+    check(await firstHistory.isVisible() && await secondHistory.isVisible(), 'both FSU recent searches must be visible');
+    await secondHistory.check();
+    await firstHistory.check();
+    await historyPage.getByRole('button',{name:'按所选搜索逐条买一张'}).click();
     await historyPage.waitForFunction(()=>info.autoBid.runner.mode==='running'&&!info.autoBid.starting);
     await historyPage.evaluate(()=>advance(10));
     const historyRun=await historyPage.evaluate(()=>({mode:info.autoBid.runner.mode,calls:sim.calls,stats:info.autoBid.runner.stats}));
-    check(historyRun.mode==='stopped'&&historyRun.stats.won===1,'recent search stops after one confirmed buy');
-    check(historyRun.calls.filter(c=>c.name==='buy').length===1&&
-        historyRun.calls.filter(c=>c.name==='bid').length===0,'recent search submits exactly one BIN');
+    check(historyRun.mode==='stopped'&&historyRun.stats.won===2,'recent search stops after both confirmed buys');
+    check(historyRun.calls.filter(c=>c.name==='buy').length===2&&
+        historyRun.calls.filter(c=>c.name==='bid').length===0,'recent search submits one BIN per condition');
+    check(historyRun.calls.filter(c=>c.name==='search').map(c=>c.defId).join(',')==='101,102',
+        'selected searches run in list order');
     await historyPage.close();
-    return {passed:true,checks:['no auto-start','two-hour setting','start','bid and long-lived BIN','server confirmation','2-second gap','cross-tab lock','pause','resume','stop','mobile width','recent search one-buy stop'],stats:running.stats};
+    const resumePage = await page.context().newPage();
+    await resumePage.goto('http://127.0.0.1:8766/test/auto-bid-harness.html');
+    await resumePage.evaluate(()=>localStorage.removeItem('fsu-demo-state'));
+    await resumePage.reload();
+    await resumePage.getByRole('checkbox',{name:/第 1 条/}).check();
+    await resumePage.getByRole('checkbox',{name:/第 2 条/}).check();
+    await resumePage.getByRole('button',{name:'按所选搜索逐条买一张'}).click();
+    await resumePage.waitForFunction(()=>info.autoBid.runner.mode==='running'&&!info.autoBid.starting);
+    await resumePage.evaluate(async()=>{for(let i=0;i<8&&info.autoBid.runner.stats.won<1;i++)await advance(1);});
+    check(await resumePage.evaluate(()=>info.autoBid.runner.stats.won===1),'first selected condition must confirm');
+    await resumePage.getByRole('button',{name:'暂停',exact:true}).click();
+    await resumePage.reload();
+    await resumePage.getByRole('checkbox',{name:/第 2 条/}).check();
+    await resumePage.getByRole('button',{name:'按所选搜索逐条买一张'}).click();
+    await resumePage.waitForFunction(()=>info.autoBid.runner.message.includes('同一组条件'));
+    check(await resumePage.evaluate(()=>{
+        const p=JSON.parse(localStorage.getItem('fsu-demo-state')).historyProgress;
+        return p.active&&p.done.length===1;
+    }), 'a changed selection must not erase saved progress');
+    await resumePage.getByRole('checkbox',{name:/第 1 条/}).check();
+    await resumePage.getByRole('button',{name:'按所选搜索逐条买一张'}).click();
+    await resumePage.waitForFunction(()=>info.autoBid.runner.mode==='running'&&!info.autoBid.starting);
+    await resumePage.evaluate(()=>advance(10));
+    check(await resumePage.evaluate(()=>info.autoBid.runner.mode==='stopped'&&sim.calls.filter(c=>c.name==='buy').map(c=>c.defId).join(',')==='102'),
+        'resume must buy only the unfinished condition');
+    await resumePage.close();
+    return {passed:true,checks:['no auto-start','two-hour setting','start','bid and long-lived BIN','server confirmation','2-second gap','cross-tab lock','pause','resume','stop','mobile width','multiple recent searches each buy once','resume retains progress'],stats:running.stats};
 }

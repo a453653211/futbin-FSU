@@ -7,6 +7,8 @@ const floor = n => floorPrice(n, tiers);
 const history = { maskedDefId: 42, name: 'Selected player', limit: 10000,
     criteria: { type: 'player', maskedDefId: 42, defId: [], minBuy: 500, maxBuy: 10000,
         league: 13, nation: 14, maxBid: 2000 } };
+const anotherHistory = { ...history, maskedDefId: 43, name: 'Another player',
+    criteria: { ...history.criteria, maskedDefId: 43, league: 14 } };
 
 function fixture(listings = [], coins = 20000) {
     let now = 1000000, balance = coins;
@@ -57,6 +59,94 @@ test('selected recent search submits one BIN after the 2-second gap and stops on
     assert.equal(f.runner.mode, 'stopped');
     assert.equal(f.runner.stats.won, 1);
     assert.equal(f.calls.filter(c => c.name === 'buy').length, 1);
+});
+
+test('multiple recent searches buy one per condition in selection order and then stop', async () => {
+    const f = fixture([listing(11), listing(12, 42), listing(13, 43)]);
+    assert.equal(f.runner.start(null, { history: [anotherHistory, history] }), true);
+    for (let i = 0; i < 18; i++) await f.tick();
+    const searches = f.calls.filter(c => c.name === 'search');
+    const buys = f.calls.filter(c => c.name === 'buy');
+    assert.equal(f.runner.mode, 'stopped');
+    assert.equal(f.runner.stats.won, 2);
+    assert.deepEqual(searches.map(c => c.args[0].maskedDefId), [43, 42]);
+    assert.deepEqual(buys.map(c => c.args[0].defId), [43, 42]);
+    assert.equal(buys.length, 2);
+    assert.ok(f.calls.every((c, i) => i === 0 || c.at - f.calls[i - 1].at >= 2000));
+});
+
+test('different conditions for the same player each buy once without reusing a listing', async () => {
+    const alternate = { ...history, criteria: { ...history.criteria, nation: 15 } };
+    const f = fixture([listing(11), listing(12)]);
+    f.runner.start(null, { history: [history, alternate] });
+    for (let i = 0; i < 18; i++) await f.tick();
+    assert.equal(f.runner.mode, 'stopped');
+    assert.deepEqual(f.calls.filter(c => c.name === 'buy').map(c => c.args[0].auction.tradeId), ['11', '12']);
+    assert.equal(f.runner.stats.won, 2);
+});
+
+test('an empty selected search does not starve another selected search', async () => {
+    const f = fixture([listing(13, 43)]);
+    f.runner.start(null, { history: [history, anotherHistory] });
+    for (let i = 0; i < 9; i++) await f.tick();
+    assert.deepEqual(f.calls.filter(c => c.name === 'search').slice(0, 2)
+        .map(c => c.args[0].maskedDefId), [42, 43]);
+    assert.equal(f.runner.stats.won, 1);
+    assert.deepEqual(f.calls.filter(c => c.name === 'buy').map(c => c.args[0].defId), [43]);
+    assert.equal(f.runner.mode, 'running');
+    assert.deepEqual(f.runner.players.map(row => row.maskedDefId), [42]);
+});
+
+test('selected conditions must be valid, unique and no more than six', () => {
+    const f = fixture();
+    assert.throws(() => f.runner.start(null, { history: [] }), /最近搜索/);
+    assert.throws(() => f.runner.start(null, { history: [history, history] }), /重复/);
+    assert.throws(() => f.runner.start(null, { history: Array(7).fill(history) }), /六条/);
+    assert.throws(() => f.runner.start(null, { history: [history, { ...anotherHistory, limit: 0 }] }), /最高价无效/);
+    assert.equal(f.calls.length, 0);
+});
+
+test('paused batch resumes completed conditions after reload without repeating a purchase', async () => {
+    const f = fixture([listing(11), listing(13, 43)]);
+    f.runner.start(null, { history: [history, anotherHistory] });
+    for (let i = 0; i < 5; i++) await f.tick();
+    assert.equal(f.runner.stats.won, 1);
+    f.runner.pause();
+    const saved = f.saved.at(-1);
+    assert.deepEqual(saved.historyProgress.done, [JSON.stringify(history.criteria)]);
+    const changed = fixture([listing(13, 43)]);
+    assert.throws(() => changed.runner.start(saved, { history: [anotherHistory] }), /同一组条件/);
+    assert.equal(changed.calls.length, 0);
+    const g = fixture([listing(13, 43)]);
+    g.runner.start(saved, { history: [anotherHistory, history] });
+    for (let i = 0; i < 8; i++) await g.tick();
+    assert.equal(g.runner.mode, 'stopped');
+    assert.deepEqual(g.calls.filter(c => c.name === 'search').map(c => c.args[0].maskedDefId), [43]);
+    assert.equal(g.calls.filter(c => c.name === 'buy').length, 1);
+});
+
+test('an uncertain first purchase blocks every remaining selected condition', async () => {
+    const f = fixture([listing(11), listing(13, 43)]);
+    f.adapter.buy = async () => { throw Object.assign(new Error('timeout'), { uncertain: true }); };
+    f.runner.start(null, { history: [history, anotherHistory] });
+    for (let i = 0; i < 9; i++) await f.tick();
+    assert.equal(f.runner.mode, 'paused');
+    assert.deepEqual(f.calls.filter(c => c.name === 'search').map(c => c.args[0].maskedDefId), [42]);
+    assert.equal(f.saved.at(-1).pending.length, 1);
+});
+
+test('missing submitted trade after reload pauses the batch before another search', async () => {
+    const f = fixture([listing(11), listing(13, 43)]);
+    f.adapter.buy = async () => { f.calls.push({ name: 'buy', at: 1000000 }); };
+    f.runner.start(null, { history: [history, anotherHistory] });
+    for (let i = 0; i < 4; i++) await f.tick();
+    f.runner.pause();
+    const g = fixture([listing(13, 43)]);
+    g.runner.start(f.saved.at(-1), { history: [history, anotherHistory] });
+    for (let i = 0; i < 6; i++) await g.tick();
+    assert.equal(g.runner.mode, 'paused');
+    assert.equal(g.calls.some(c => c.name === 'search'), false);
+    assert.equal(g.saved.at(-1).blocked.length, 1);
 });
 
 test('wrong player, below-minimum and above-maximum results cannot be bought', async () => {
