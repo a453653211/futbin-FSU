@@ -1,4 +1,23 @@
 {
-  "upstreamVersion": "26.09",
-  "version": "26.09.20"
+  "importedAt": "2026-10-16",
+  "fsu": {
+    "upstreamVersion": "27.1",
+    "version": "27.1.4",
+    "source": "upstream/FSU27.1.user.js",
+    "file": "dist/FSU-smart-sbc.user.js",
+    "sha256": "2b09fffd7697b67783674aa43714ca46c1c11463645771f8459c04506f5bf244"
+  },
+  "fodder": {
+    "baseVersion": "0.5.4",
+    "version": "0.5.6",
+    "source": "src/fodder.user.js",
+    "file": "dist/Fodder.user.js",
+    "baseSha256": "2465d6d22ae9b75965be735d910b718821186b377b510ebca01a0521a7a4fbe9"
+  },
+  "oao": {
+    "version": "27.0.1",
+    "source": "src/oao.user.js",
+    "file": "dist/OAO.user.js",
+    "sha256": "b5f7403281747884371dd3f4818f13b02404dc1561a1595270bcfae078a19618"
+  }
 }

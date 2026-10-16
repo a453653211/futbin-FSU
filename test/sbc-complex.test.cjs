@@ -15,12 +15,10 @@ test('compiles live aggregate requirements and rejects unknown or mixed aggregat
     assert.throws(()=>C.compile([{...req('TEAM_RATING',81),keys:[{name:'TEAM_RATING',value:[81]},{name:'LEAGUE_COUNT',value:[4]}]}],11));
 });
 test('rating agrees with saved EA implementation across float and integer modes',()=>{
-    const src=fs.readFileSync(require('node:path').join(__dirname,'../.reference/compiled_2.js'),'utf8');
-    const start=src.indexOf('UTSquadEntity.prototype._calculateRating=function'),end=src.indexOf(',UTSquadEntity.prototype.updateChemistry',start);
-    assert.ok(start>=0&&end>start);
+    const src=require('./fixtures/ea-methods.cjs').rating;
     for(const floating of [true,false]){
         const env={UTSquadEntity:{prototype:{},FIELD_PLAYERS:11},services:{Configuration:{checkFeatureEnabled:()=>floating}},UTServerSettingsRepository:{KEY:{}}};
-        vm.runInNewContext(src.slice(start,end),env);
+        vm.runInNewContext(src,env);
         for(let seed=0;seed<100;seed++){
             const players=Array.from({length:11},(_,i)=>p(i,{rating:45+(seed*19+i*37)%55}));
             const squad={isSBC:()=>true,getFieldPlayers:()=>players.map(p=>({item:{...p,isValid:()=>true}}))};
@@ -38,6 +36,23 @@ test('exact nation count and dominant same-club count are simultaneous condition
     const rules=C.compile([req('NATION_COUNT',2,'EXACT'),req('SAME_CLUB_COUNT',2,'LOWER')],3);
     assert.equal(C.evaluate([p(1),p(2),p(3,{nationId:2,clubId:2})],[14,14,14],rules,context).valid,true);
     assert.equal(C.evaluate([p(1),p(2),p(3,{nationId:2})],[14,14,14],rules,context).valid,false);
+});
+test('major matches filler uses bronze after satisfying silver and chemistry requirements',async()=>{
+    const rules=C.compile([req('NATION_ID',1,'GREATER',1),req('CLUB_COUNT',4),
+        req('PLAYER_LEVEL',2,'GREATER',3),req('PLAYER_QUALITY',1),req('CHEMISTRY_POINTS',14)],11);
+    const players=[];
+    for(const [tier,rating] of [[1,60],[2,65],[3,75]])for(let i=0;i<16;i++){
+        const id=players.length+1;
+        players.push(p(id,{rating,tier,clubId:i%4+1,owned:true}));
+    }
+    const fixed=[p(100,{rating:69,tier:2,clubId:1,owned:true}),
+        p(101,{rating:60,tier:1,clubId:2,owned:true})];
+    const result=await C.search({players,positions:Array(11).fill(14),rules,context,
+        fixed,seed:1,maxMs:1000,stopAtFirst:true,yieldFn:async()=>{}});
+    assert.equal(result.status,'feasible');
+    assert.equal(C.evaluate(result.solution,Array(11).fill(14),rules,context).valid,true);
+    assert.deepEqual(result.solution.slice(0,2).map(card=>card.id),['100','101']);
+    assert.deepEqual(result.solution.map(card=>card.tier).sort(),[1,1,1,1,1,1,1,1,2,2,2]);
 });
 test('budget exhaustion is unknown; cancelled planning cannot produce a purchasable plan',async()=>{
     const options={players:[p(1)],positions:[14],rules:[],context,maxMs:0};

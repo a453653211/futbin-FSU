@@ -31,7 +31,7 @@ function fixture(options={}){
             submitChallenge:()=>{throw new Error('Must never submit');}}};
     const info={run:{},base:{},set:{goldenrange:83},build:{},lock:[]};
     const adapter={scope:()=> '27:user:pc',session:()=>true,check:()=>{},load:()=>null};
-    const events={autoBidAdapter:()=>adapter,autoBidObserve:create=>new Promise((resolve,reject)=>create().observe({},(_,r)=>r.success?resolve(r):reject(new Error('save failed')))),
+    const events={smartSbcMarketAdapter:()=>adapter,smartSbcMarketObserve:create=>new Promise((resolve,reject)=>create().observe({},(_,r)=>r.success?resolve(r):reject(new Error('save failed')))),
         ignorePlayerToCriteria:()=>({rareflag:[0,1],removeSquad:true}),getItemBy:(_,criteria,__,items)=>items,
         createVirtualChallenge:c=>({...challenge(888),eligibilityRequirements:c.eligibilityRequirements,squad:squad(c.squad.getPlayers().map(s=>s.getItem()))})};
     const document={createElement:tag=>new Element(tag)},button={getRootElement:()=>root},root=new Element('button'),controller={_challenge:challenges[0]};

@@ -1,0 +1,5 @@
+* text=auto eol=lf
+upstream/*.user.js -text -whitespace
+src/oao.user.js -text -whitespace
+dist/*.user.js -text
+dist/OAO.user.js -whitespace

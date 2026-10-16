@@ -1,4 +1,12 @@
 /* Runs inside FSU's futweb closure. Uses its existing EA entities and exclusion settings. */
+
+events.smartSbcCheckIdle = (allowHighValue = false) => {
+    const page = typeof unsafeWindow === 'undefined' ? {} : unsafeWindow;
+    const retry = page.__fodderGalleryRetry5m?.status();
+    if ((!allowHighValue && info.run.highValue) || info.run.template || info.run.losauction || info.run.bulkbuy || info.run.openPacks || info.autoSbc?.running || info.packSbcLoop?.running ||
+        page.__fodder?.gallery?.run?.running || page.__fodderLatestCards?.status().running || (retry && retry.phase !== 'idle'))
+        throw new Error('其他 FSU / Fodder / 高价值卡任务正在运行，请先停止后再继续。');
+};
 events.smartSbcObserve = (observable) => new Promise((resolve, reject) => {
     const observer = {};
     let settled = false;
@@ -108,6 +116,8 @@ events.smartSbcExplain = (inventory, candidates, fixed, slots, rules, exclusions
 
 events.smartSbcFill = async (controller, button) => {
     if (info.run.smartSbc || info.base.savesquad) return;
+    try { events.smartSbcCheckIdle(); }
+    catch (error) { services.Notification.queue([error.message, UINotificationType.NEGATIVE]); return; }
     const challenge = controller._challenge, squad = challenge?.squad;
     if (!squad) return;
     info.run.smartSbc = true;
@@ -116,9 +126,14 @@ events.smartSbcFill = async (controller, button) => {
     const signature = () => squad.getPlayers().map(s => `${s.getItem()?.id}:${s.getItem()?.definitionId}`).join('|');
     const initialSignature = signature();
     const initialScope = events.smartSbcLegacyFilters();
+    const account = () => services.User.getUser()?.getSelectedPersona?.();
+    const accountSignature = () => { const p = account(); return p?.id && p?.sku ? `${p.id}:${p.sku}:${info.base.year}` : null; };
+    const initialAccount = accountSignature();
     const settings = () => JSON.stringify([info.set, info.build, info.lock]);
     const initialSettings = settings();
     const check = () => {
+        events.smartSbcCheckIdle();
+        if (!initialAccount || accountSignature() !== initialAccount) throw new Error('账号或平台已改变，本次填充已取消。');
         if (settings() !== initialSettings || events.smartSbcLegacyFilters() !== initialScope || info.base.savesquad || !button.getRootElement().isConnected || controller._challenge !== challenge || challenge.squad !== squad || signature() !== initialSignature)
             throw new Error('页面或阵容已改变，本次填充已取消。');
     };
@@ -138,13 +153,15 @@ events.smartSbcFill = async (controller, button) => {
         }
         button.setText('读取球员…');
         let activeIds = new Set();
+        check();
         if (services.Squad?.requestSquadList && services.Squad?.requestSquadById) {
             const list = (await events.smartSbcObserve(services.Squad.requestSquadList())).data;
             check();
             const active = (await events.smartSbcObserve(services.Squad.requestSquadById(list.activeSquadId))).data.squad;
             activeIds = new Set(active.getPlayers().map(s => String(s.getItem()?.id)));
-        }
+        } else throw new Error('无法核对当前主力阵容，已停止填充。');
         const inventory = await events.smartSbcInventory(check);
+        check();
         const fixed = [], empty = [];
         for (const index of indices) {
             const item = original[index];

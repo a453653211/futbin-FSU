@@ -37,7 +37,12 @@ function fixture(options={}) {
             });
         },popup:(...args)=>calls.popups.push(args),showLoader:()=>calls.loader++,hideLoader:()=>calls.loader--,
         saveOldSquad:()=>{},createVirtualChallenge:()=>({squad:{setPlayers:()=>{}},meetsRequirements:()=>options.valid!==false})};
+    let persona={id:1,sku:'pc'};
     const services={
+        User:{getUser:()=>({getSelectedPersona:()=>persona})},
+        Squad:options.noSquad ? {} : {
+            requestSquadList:()=>observable({success:true,data:{activeSquadId:1}}),
+            requestSquadById:()=>observable({success:true,data:{squad:{getPlayers:()=>[]}}})},
         Notification:{queue:m=>messages.push(m)},
         Club:{getStats:()=>observable({success:true,response:{stats:[{type:'players',count:ps.length}]}}),
             search:c=>{calls.club.push(c.offset);if(options.navigate) root.isConnected=false;
@@ -52,9 +57,21 @@ function fixture(options={}) {
         ItemPile:{STORAGE:9},UTSearchCriteriaDTO:class {},repositories:{Item:{getUnassignedItems:()=>[]}},
         GM_getValue:()=>options.legacyFilters===true,enums:{UIDialogOptions:{OK:2}},
         setTimeout,clearTimeout,console:{warn:()=>{}}});
-    return {events,info,controller,button,calls,messages,initial,squad,challenge};
+    return {events,info,controller,button,calls,messages,initial,squad,challenge, switchAccount:()=>{persona={id:2,sku:'pc'};}};
 }
 const fill = f => f.events.smartSbcFill(f.controller,f.button);
+
+test('missing active-squad interface fails closed before saving',async()=>{
+    const f=fixture({noSquad:true});await fill(f);assert.equal(f.calls.save,0);assert.match(f.messages.at(-1)[0],/主力阵容/);
+});
+test('account switching during inventory load cancels without saving',async()=>{
+    const f=fixture();const original=f.events.smartSbcInventory;
+    f.events.smartSbcInventory=async(...args)=>{const result=await original(...args);f.switchAccount();return result;};
+    await fill(f);assert.equal(f.calls.save,0);assert.match(f.messages.at(-1)[0],/账号/);
+});
+test('upstream automatic SBC job blocks smart fill before inventory reads',async()=>{
+    const f=fixture();f.info.autoSbc={running:true};await fill(f);assert.equal(f.calls.save,0);assert.equal(f.calls.club.length,0);
+});
 test('integration saves a validated lineup once and never submits',async()=>{
     const f=fixture();await fill(f);
     assert.equal(f.calls.save,1);

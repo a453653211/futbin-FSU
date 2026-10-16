@@ -29,9 +29,11 @@ events.smartSbcSignature = squad => squad.getPlayers().map(s=>`${s.getItem()?.id
 
 events.smartSbcGroup = async (controller, button) => {
     if(info.run.smartSbc || info.base.savesquad)return;
+    try { events.smartSbcCheckIdle(); }
+    catch (error) { events.notice(error.message, 2); return; }
     const current=controller._challenge;
     if(!current?.squad)return;
-    const adapter=events.autoBidAdapter(),scope=adapter.scope();
+    const adapter=events.smartSbcMarketAdapter(),scope=adapter.scope();
     info.run.smartSbc=true;
     const root=button.getRootElement(),panel=document.createElement('section');
     panel.style.cssText='padding:16px;background:#202630;color:white;line-height:1.6;max-height:65vh;overflow:auto;';
@@ -44,6 +46,7 @@ events.smartSbcGroup = async (controller, button) => {
     const settings=()=>JSON.stringify([info.set,info.build,info.lock,events.smartSbcLegacyFilters()]);
     const initialSettings=settings(),signatures=new Map();
     const check=()=>{
+        events.smartSbcCheckIdle();
         if(stopped||!panel.isConnected||controller._challenge!==current||settings()!==initialSettings||adapter.scope()!==scope||info.base.savesquad)
             throw new Error('页面、账号或筛选设置已改变，规划已停止。');
         if(!adapter.session())throw new Error('EA 正在重新认证，请稍后重新打开规划。');
@@ -51,12 +54,12 @@ events.smartSbcGroup = async (controller, button) => {
             throw new Error('挑战阵容已改变，请重新规划。');
     };
     const pace=async fn=>{
-        check();if(info.autoBidTainted)throw new Error('上次请求结果不确定，请刷新网页后继续。');
+        check();if(info.smartSbcMarketTainted)throw new Error('上次请求结果不确定，请刷新网页后继续。');
         const delay=Math.max(0,lastRequest+5000-Date.now());
         if(delay)await new Promise(r=>setTimeout(r,delay));check();
         try{return await fn();}finally{lastRequest=Date.now();}
     };
-    const request=create=>pace(()=>events.autoBidObserve(create));
+    const request=create=>pace(()=>events.smartSbcMarketObserve(create));
     const refreshInventory=async()=>{
         const list=(await request(()=>services.Squad.requestSquadList())).data;
         const active=(await request(()=>services.Squad.requestSquadById(list.activeSquadId))).data.squad;

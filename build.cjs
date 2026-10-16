@@ -1,85 +1,99 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { minify } = require('terser');
-const { upstreamVersion, version } = require('./release.json');
-const completionMarker = `FSU_INSTALL_COMPLETE_${version.replace(/\./g, '_')}`;
+const release = require('./release.json');
 const root = __dirname;
 const read = file => fs.readFileSync(path.join(root, file), 'utf8');
-let source = read('【FSU】EAFC FUT WEB 增强器-26.09.txt');
-function replaceOnce(anchor, replacement) {
-    if (source.split(anchor).length !== 2) throw new Error(`Expected exactly one anchor: ${anchor}`);
-    source = source.replace(anchor, () => replacement);
-}
-replaceOnce('// @name         【FSU】EAFC FUT WEB 增强器', '// @name         【FSU】EAFC FUT WEB 增强器 · 智能SBC与市场购买');
-replaceOnce(`// @version      ${upstreamVersion}`, `// @version      ${version}`);
-source = source.replace(/^\/\/ @(?:downloadURL|updateURL).*\r?\n/gm, '');
-// Route every FSU dialog through the adapter, including settings and pack dialogs.
-const dialogCalls = source.match(/new EADialogViewController\(/g) || [];
-if (dialogCalls.length !== 8) throw new Error(`Unexpected FSU dialog count: ${dialogCalls.length}`);
-source = source.replace(/new EADialogViewController\(/g, 'events.createDialog(');
-replaceOnce('        events.popup = (t,m,c,o,i,n,s) => {',
-    read('src/dialog-compat.js') + '\n        events.popup = (t,m,c,o,i,n,s) => {');
-replaceOnce('        //26.04 SBC初始化需求内容',
-    '__FSU_SBC_SOLVER__\n' +
-    '__FSU_SBC_COMPLEX__\n' +
-    read('src/sbc-procurement.js').replace(/if \(typeof module[^\n]+\n?$/, '') + '\n' +
-    read('src/sbc-integration.js') + '\n' + read('src/sbc-group-integration.js') + '\n        //26.04 SBC初始化需求内容');
-const marketModules =
-    read('src/market-catalog.js').replace(/if \(typeof module[^\n]+\n?$/, '') + '\n' +
-    read('src/futbin-catalog-source.js').replace(/if \(typeof module[^\n]+\n?$/, '') + '\n' +
-    read('src/auto-bid-core.js').replace(/if \(typeof module[^\n]+\n?$/, '') + '\n' +
-    read('src/auto-bid-integration.js');
-replaceOnce('        //26.07 FG计算', '__FSU_MARKET_MODULES__\n        //26.07 FG计算');
-replaceOnce('                let hasChemistry = 0, hasRating = 0, exactRating = 0;',
-    `                this._fsu.smartSbcBtn = events.createButton(new UTStandardButtonControl(),
-                    '智能填充（按任务条件）',
-                    button => events.smartSbcFill(thisController, button), 'call-to-action');
-                this._fsu.smartSbcBtn.getRootElement().title = '保留已放入球员，按任务条件补齐空位；不会自动提交';
+const sha256 = data => crypto.createHash('sha256').update(data).digest('hex');
+
+function prepareFsu(input = read(release.fsu.source)) {
+    let source = input.replace(/\r\n/g, '\n');
+    function replaceOnce(anchor, replacement) {
+        if (source.split(anchor).length !== 2) throw new Error(`Expected exactly one FSU 27.1 anchor: ${anchor}`);
+        source = source.replace(anchor, () => replacement);
+    }
+    replaceOnce('// @name                      【FSU】EAFC FUT WEB 增强器 plus',
+        '// @name                      【FSU】EAFC FUT WEB 增强器 plus · 智能SBC');
+    replaceOnce(`// @version                   ${release.fsu.upstreamVersion}`, `// @version                   ${release.fsu.version}`);
+    source = source.replace(/^\/\/ @(?:downloadURL|updateURL).*\n/gm, '');
+    const dialogCalls = source.match(/new EADialogViewController\(/g) || [];
+    if (dialogCalls.length !== 12) throw new Error(`Unexpected FSU dialog count: ${dialogCalls.length}`);
+    source = source.replace(/new EADialogViewController\(/g, 'events.createDialog(');
+    replaceOnce('        events.popup = (t,m,c,o,i,n,s) => {',
+        read('src/dialog-compat.js') + '\n        events.popup = (t,m,c,o,i,n,s) => {');
+    const modules = ['sbc-solver', 'sbc-complex', 'sbc-procurement', 'sbc-market-adapter', 'sbc-integration', 'sbc-group-integration', 'high-value-integration'];
+    replaceOnce('        //26.04 SBC初始化需求内容', modules.map(name =>
+        read(`src/${name}.js`).replace(/^if \(typeof module[^\n]+\n?/gm, '')).join('\n') + '\n        //26.04 SBC初始化需求内容');
+    replaceOnce('                let hasChemistry = 0, hasRating = 0, exactRating = 0;', `
+                this._fsu.smartSbcBtn = events.createButton(new UTStandardButtonControl(),
+                    '智能填充（按任务条件）', button => events.smartSbcFill(thisController, button), 'call-to-action');
+                this._fsu.smartSbcBtn.getRootElement().title = '保留已放入球员，按真实挑战条件补齐空位；保存前通过 EA 校验，不自动提交';
                 this._fsu.smartSbcGroupBtn = events.createButton(new UTStandardButtonControl(),
                     '整组规划 / 缺卡补购', button => events.smartSbcGroup(thisController, button), 'call-to-action');
                 this._fsu.smartSbcScopeBtn = events.createButton(new UTStandardButtonControl(),
                     events.smartSbcScopeText(), button => {
+                        if (info.run.smartSbc) return;
                         GM_setValue('smartSbcLegacyFilters', !events.smartSbcLegacyFilters());
                         button.setText(events.smartSbcScopeText());
                     }, 'mini');
-                this._fsu.smartSbcScopeBtn.getRootElement().title = '点击切换：全部联赛含可交易 / 沿用原 FSU 筛选。两种模式均保护锁卡、主力和进化球员，并遵守最高评分和允许卡种设置。';
+                this._fsu.smartSbcScopeBtn.getRootElement().title = '切换全部联赛含可交易 / 沿用 FSU 筛选；始终保护锁卡、主力、进化和租借，遵守评分及卡种设置';
                 let hasChemistry = 0, hasRating = 0, exactRating = 0;`);
-replaceOnce('            const exchangeElement = view._btnExchange.getRootElement();',
-    `            const exchangeElement = view._btnExchange.getRootElement();
+    replaceOnce('            const exchangeElement = view._btnExchange.getRootElement();', `
+            const exchangeElement = view._btnExchange.getRootElement();
             if (fsu?.smartSbcScopeBtn) exchangeElement.before(fsu.smartSbcScopeBtn.getRootElement());
             if (fsu?.smartSbcGroupBtn) exchangeElement.before(fsu.smartSbcGroupBtn.getRootElement());
             if (fsu?.smartSbcBtn) exchangeElement.before(fsu.smartSbcBtn.getRootElement());`);
-// Existing FSU assumes the optional template button always exists; avoid blocking the new UI.
-replaceOnce('                Object.assign(fsu.fillSquadBtn.getRootElement().style,{',
-    '                if (fsu.fillSquadBtn) Object.assign(fsu.fillSquadBtn.getRootElement().style,{');
-replaceOnce('                fsu.fillSquadBtn.addClass("mini");',
-    '                if (fsu.fillSquadBtn) fsu.fillSquadBtn.addClass("mini");');
-// Tampermonkey saved the previous 1 MB paste only through source line 17011.
-// Keep the metadata block intact and preserve the original FSU names
-// so grants and URL matches continue to work. The old 601 KB paste was cut short.
-const marker = '// ==/UserScript==';
-const afterHeader = source.indexOf(marker) + marker.length;
-if (afterHeader < marker.length) throw new Error('Missing userscript metadata');
-// Only shorten local names inside our self-contained solver and market modules.
-// The original FSU program and shared top-level names keep their spelling.
-const localMinify = code => minify(code, { compress: { passes: 2 }, mangle: true,
-    format: { comments: false } });
-Promise.all([
-    localMinify(read('src/sbc-solver.js').replace(/if \(typeof module[^\n]+\n?$/, '')),
-    localMinify(read('src/sbc-complex.js').replace(/if \(typeof module[^\n]+\n?$/, '')),
-    localMinify(marketModules)
-]).then(([solver, complex, market]) => {
-    if (!solver.code || !complex.code || !market.code) throw new Error('Module minification returned an empty program');
-    replaceOnce('__FSU_SBC_SOLVER__', solver.code);
-    replaceOnce('__FSU_SBC_COMPLEX__', complex.code);
-    replaceOnce('__FSU_MARKET_MODULES__', market.code);
-    return minify(source.slice(afterHeader), { compress: { passes: 2 }, mangle: false,
-    format: { comments: false, beautify: false, max_line_len: 500 } }).then(result => {
-    if (!result.code) throw new Error('Terser returned an empty program');
-    const compact = source.slice(0, afterHeader) + '\n' + result.code + `\n// ${completionMarker}\n`;
-    const size = Buffer.byteLength(compact, 'utf8');
-    if (size >= 590000 || compact.length >= 560000) throw new Error(`Installer grew beyond the verified paste size: ${size} bytes / ${compact.length} characters`);
-    fs.writeFileSync(path.join(root, 'FSU-26.09.1-smart-sbc.user.js'), compact);
-    console.log(`Built FSU-26.09.1-smart-sbc.user.js (version ${version}, ${size} bytes)`);
-    });
-}).catch(error => { console.error(error); process.exitCode = 1; });
+    replaceOnce('                Object.assign(fsu.fillSquadBtn.getRootElement().style,{',
+        '                if (fsu.fillSquadBtn) Object.assign(fsu.fillSquadBtn.getRootElement().style,{');
+    replaceOnce('                fsu.fillSquadBtn.addClass("mini");', '                if (fsu.fillSquadBtn) fsu.fillSquadBtn.addClass("mini");');
+    // Reserve the same inventory against the upstream template / automatic SBC flows.
+    for (const anchor of [
+        'events.startAutoSbcLoop = async(controller) => {',
+        'events.openPacksWithSBC = async (packId, packName, packNum, excludeLeague, sbcKey, minRatingThreshold = 84) => {',
+        'events.getTemplate = async function(e,type,sId,options = {}){',
+        'events.buyConceptPlayer = async (players, view) => {',
+        'events.losAuctionSell = async(e,t) => {'
+    ]) replaceOnce(anchor, anchor + '\n            if (info.run.smartSbc || info.run.highValue) { events.notice("请先停止智能 SBC / 高价值卡任务。", 2); return; }');
+    replaceOnce("    'use strict';\n    !function", "    'use strict';\n" +
+        read('src/high-value-core.js').replace(/^if \(typeof module[^\n]+\n?/gm, '') + '\n' +
+        read('src/high-value-futbin.js') + '\n    !function');
+    replaceOnce('        UTTransferListViewController.prototype._renderView = function(...args) {\n            call.view.transfer.call(this, ...args);',
+        '        UTTransferListViewController.prototype._renderView = function(...args) {\n            call.view.transfer.call(this, ...args);\n            events.highValueMount(this.getView());');
+    // One FSU installation owns all prototype hooks. Keep metadata identity for in-place upgrades.
+    replaceOnce('    function futweb() {', `    function futweb() {
+        if (unsafeWindow.__fsuSmartSbcInstalled) return;
+        unsafeWindow.__fsuSmartSbcInstalled = '${release.fsu.version}';`);
+    return source;
+}
+
+async function build() {
+    const original = fs.readFileSync(path.join(root, release.fsu.source));
+    if (sha256(original) !== release.fsu.sha256) throw new Error('FSU upstream hash changed; compare and update the adapter explicitly.');
+    fs.mkdirSync(path.join(root, 'dist'), { recursive: true });
+    const source = prepareFsu();
+    const end = source.indexOf('// ==/UserScript==') + '// ==/UserScript=='.length;
+    const compact = await minify(source.slice(end), { compress: { passes: 2 }, mangle: false,
+        format: { comments: false, max_line_len: 500 } });
+    if (!compact.code) throw new Error('Empty FSU build');
+    const output = source.slice(0, end) + '\n' + compact.code + `\n// FSU_INSTALL_COMPLETE_${release.fsu.version.replace(/\./g, '_')}\n`;
+    fs.writeFileSync(path.join(root, release.fsu.file), output);
+    for (const name of ['fodder', 'oao']) {
+        const config = release[name];
+        let data = fs.readFileSync(path.join(root, config.source));
+        if (name === 'fodder') {
+            let code = data.toString('utf8');
+            const base = config.baseVersion.replace(/\./g, '\\.');
+            const versions = new RegExp(`(@version[ \\t]+|VERSION = ')${base}`, 'g');
+            if ((code.match(versions) || []).length !== 3) throw new Error('Fodder version anchors changed');
+            code = code.replace(versions, (_, prefix) => prefix + config.version);
+            data = Buffer.from(code);
+        }
+        const actual = data.toString('utf8').match(/^\/\/ @version\s+([^\r\n]+)/m)?.[1];
+        if (actual !== config.version) throw new Error(`${name} metadata version does not match release.json`);
+        fs.writeFileSync(path.join(root, config.file), data);
+    }
+    for (const name of ['fodder', 'fsu', 'oao']) console.log(`${release[name].file} · ${release[name].version} · ${fs.statSync(path.join(root, release[name].file)).size} bytes`);
+}
+module.exports = { build, prepareFsu, sha256 };
+if (require.main === module) build().catch(error => { console.error(error); process.exitCode = 1; });

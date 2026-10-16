@@ -6,7 +6,7 @@ const vm = require('node:vm');
 
 // Execute the actual EA dialog constructors/methods inspected in the official bundle.
 // The DOM/base UI scaffolding is mocked; option creation and tap dispatch are EA code.
-const ea = fs.readFileSync(path.join(__dirname, '../.reference/compiled_2.js'), 'utf8');
+const ea = require('./fixtures/ea-methods.cjs').dialog;
 function extract(name, parent) {
     const start = ea.indexOf(`${name}=(i=>{`);
     const end = ea.indexOf(`})(${parent})`, start);

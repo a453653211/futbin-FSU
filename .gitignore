@@ -3,11 +3,5 @@ node_modules/
 .playwright-cli/
 .playwright-mcp/
 
-# Local live-account records and browser logs stay on this machine.
-.reference/*
-!.reference/compiled_2.js
-!.reference/ocompiled.decoded.js
-!.reference/FSU-26.09.17-smart-sbc.user.js
-!.reference/auto-bid-desktop.png
-!.reference/auto-bid-running.png
-!.reference/auto-bid-mobile.png
+# Local live-account records and inventory snapshots stay on this machine.
+.reference/

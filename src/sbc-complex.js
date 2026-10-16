@@ -143,6 +143,33 @@ const FsuSbcComplex = (() => {
             bestPenalty=Math.min(bestPenalty,m.penalty);
             if(m.valid&&better(m,bestMetrics)){best=s.slice();bestMetrics=m;onProgress({solution:best.slice(),metrics:m,iterations});}
         };
+        // A feasible-first search can stop with costly filler cards. Try cheaper
+        // one-card substitutions while rechecking every squad requirement.
+        const refine=async()=>{
+            if(!best||!open.length)return;
+            const ranked=pool.slice().sort((a,b)=>Number(a.owned===false)-Number(b.owned===false)||a.rating-b.rating);
+            let improved=true;
+            while(improved&&iterations<maxIterations&&Date.now()-start<maxMs){
+                improved=false;
+                for(const slot of open){
+                    const original=best[slot];
+                    for(const candidate of ranked){
+                        if(iterations>=maxIterations||Date.now()-start>=maxMs)return;
+                        if(identity(candidate)===identity(original))continue;
+                        const fewerMissing=original.owned===false&&candidate.owned!==false;
+                        if(!fewerMissing&&(candidate.owned===false)!==(original.owned===false))continue;
+                        if(!fewerMissing&&candidate.rating>=original.rating)continue;
+                        if(best.some((p,i)=>i!==slot&&identity(p)===identity(candidate)))continue;
+                        const next=best.slice();next[slot]=candidate;
+                        const metrics=evaluate(next,positions,rules,context);iterations++;
+                        if(iterations%200===0)await check();
+                        if(metrics.valid&&better(metrics,bestMetrics)){
+                            consider(next,metrics);improved=true;break;
+                        }
+                    }
+                }
+            }
+        };
         for(let restart=0;iterations<maxIterations && Date.now()-start<maxMs;restart++){
             const scoped=scopes[restart%scopes.length];
             const choices=positions.map(pos=>{const match=scoped.filter(p=>p.positions?.includes(pos));return match.length?match:scoped;});
@@ -179,6 +206,7 @@ const FsuSbcComplex = (() => {
             }
             if(best&&stopAtFirst)break;
         }
+        await refine();
         await check();
         return {status:best?'feasible':'unknown',reason:best?'found':'search-budget',solution:best,metrics:bestMetrics,iterations,bestPenalty,optimal:false};
     }
