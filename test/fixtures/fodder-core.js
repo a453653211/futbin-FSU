@@ -23,7 +23,29 @@
         // buy run onChange failed
         return run;
     }
-    window.__fodder = { gallery: { run: null }, mockFactory: nativeRun };
+    async function galleryPrices(ids, platform = 'pc') {
+        (window.__mockGalleryQuotes ||= []).push({ ids: [...ids], platform });
+        return Object.fromEntries(ids.map(id => [id, id === 9104 ? 0 : 1000]));
+    }
+    async function galleryLoad(cat, set) {
+        const route = '/api/gallery/' + cat + '/' + set.slug;
+        const key = cat + ':' + set.slug, state = window.__fodder.gallery;
+        (window.__mockGalleryLoads ||= []).push(route);
+        if (state.sets.has(key)) return state.sets.get(key);
+        const ids = cat === 'other' ? [9107] : set.slug === 'team-a' ? [9101, 9103, 9104, 9105] : [9102, 9103, 9106];
+        let prices = {};
+        try { prices = await galleryPrices(ids); }
+        catch (error) { console.debug('gallery: no prices', error); }
+        try { if (window.__mockGalleryError) throw Error('read failed'); }
+        catch (error) { console.debug('gallery: club not read, First Owner counts as unknown', error); throw error; }
+        const value = { cards: ids.map(id => ({ id, name: id === 9101 || id === 9102 ? 'Same Player' : 'Gallery ' + id,
+            rating: 87, price: prices[id], collected: id === 9101 || id === 9103 })) };
+        state.sets.set(key, value); return value;
+    }
+    window.__fodder = { gallery: { run: null, sets: new Map(), index: [
+        { slug: 'clubs', name: '俱乐部', sets: [{ slug: 'team-a', name: '球队 A' }, { slug: 'team-b', name: '球队 B' }] },
+        { slug: 'other', name: '其他分类', sets: [{ slug: 'team-a', name: '球队 C' }] }
+    ] }, mockFactory: nativeRun };
     const nav = document.createElement('nav'); nav.id = 'mock-gallery-tabs';
     for (const title of ['全部套装', '获取代币', '提升分数', '完成套装']) { const b = document.createElement('button'); b.textContent = title; nav.append(b); }
     document.body.append(nav);

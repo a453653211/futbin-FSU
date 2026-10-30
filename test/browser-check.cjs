@@ -6,6 +6,7 @@ const { read, root } = require('./helpers.cjs');
 const installEaMocks = require('./fixtures/ea-browser.js');
 const release = require('../release.json');
 const highValue = require('./high-value-browser.cjs');
+const galleryBuying = require('./fodder-gallery-browser.cjs');
 const eaURL = 'https://www.ea.com/ea-sports-fc/ultimate-team/web-app/';
 const fsu = read(release.fsu.file), fodder = read(release.fodder.file), oao = read(release.oao.file);
 const prototypes = {};
@@ -27,7 +28,7 @@ async function main() {
     const browser = await chromium.launch({ headless: true, ...(process.env.FC27_CHROMIUM_PATH ? { executablePath: process.env.FC27_CHROMIUM_PATH } : {}) });
     try {
         const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
-        const errors = []; page.on('pageerror', error => errors.push(error.message));
+        const errors = []; page.on('pageerror', error => errors.push(error.stack || error.message));
         await page.route('**/*', route => {
             const u = new URL(route.request().url());
             if (u.href === eaURL) return route.fulfill({ contentType: 'text/html', body: '<!doctype html><html><head></head><body><h1>FC27 offline test</h1></body></html>' });
@@ -53,6 +54,45 @@ async function main() {
         assert.deepEqual(errors, []);
         assert.equal(await page.evaluate(() => window.__eaCalls.buys + window.__eaCalls.saves + window.__eaCalls.submits), 0);
         console.log('PASS full FSU + OAO + Fodder startup; no automatic saves, purchases or submits');
+        await page.waitForFunction(() => __fodderLatestCards.status().entryVisible);
+        // The live core now exposes three Gallery tabs; Complete Sets is no longer a top tab.
+        await page.evaluate(() => {
+            const row = document.querySelector('#mock-gallery-tabs');
+            row.querySelectorAll('button:not(#fgnew-latest-tab)').forEach((button, index) => {
+                if (index === 3) button.remove();
+            });
+        });
+        await page.waitForTimeout(1100); // Let the existing one-second mounting check run.
+        assert.equal(await page.evaluate(() => __fodderLatestCards.status().entryVisible), true,
+            'latest cards must remain visible with the three current Gallery tabs');
+        assert.equal(await page.locator('#mock-gallery-tabs > #fgnew-latest-tab').count(), 1);
+        assert.equal(await page.locator('#fgnew-latest-tab').evaluate(n => n.previousElementSibling.textContent), '提升分数');
+        for (const [labels, leaf] of [
+            [['All Sets', 'Earn Tokens', 'Increase Score'], false],
+            [['全部套裝', '獲取代幣', '提升分數'], true],
+            [['分类', '代币', '分数', '套装'], false],
+            [['全部套装', '获取代币', '提升分数'], false]
+        ]) {
+            await page.evaluate(({ labels, leaf }) => {
+                const row = document.createElement('div'); row.id = 'mock-gallery-tabs';
+                row.style.display = 'flex';
+                for (const label of labels) {
+                    const control = document.createElement(leaf ? 'span' : 'button');
+                    control.textContent = label; row.append(control);
+                }
+                document.querySelector('#mock-gallery-tabs').replaceWith(row);
+            }, { labels, leaf });
+            await page.waitForFunction(() => document.querySelector('#mock-gallery-tabs > #fgnew-latest-tab') &&
+                __fodderLatestCards.status().entryVisible);
+            assert.equal(await page.locator('#fgnew-latest-tab').count(), 1);
+            assert.equal(await page.locator('#fgnew-latest-tab').evaluate(n => n.previousElementSibling.textContent), labels.at(-1));
+        }
+        await page.evaluate(() => { document.querySelector('#mock-gallery-tabs').hidden = true; });
+        await page.waitForFunction(() => !__fodderLatestCards.status().entryVisible);
+        await page.evaluate(() => { document.querySelector('#mock-gallery-tabs').hidden = false; });
+        await page.waitForFunction(() => __fodderLatestCards.status().entryVisible);
+        assert.equal(await page.evaluate(() => __eaCalls.buys + __eaCalls.saves + __eaCalls.submits), 0);
+        console.log('PASS three/four-tab Gallery layouts, Chinese/Traditional/English labels, leaf controls, remount and hide/restore without duplicates or automatic tasks');
         await page.evaluate(() => {
             Object.assign(info.set, { goldenrange: 82, shield_flag: [], shield_league: [] });
             info.lock = [1];
@@ -83,6 +123,116 @@ async function main() {
         assert.equal(outcome.saves, 1, JSON.stringify(outcome)); assert.equal(outcome.submits, 0); assert.equal(outcome.buys, 0);
         assert.deepEqual(outcome.ids, [11, 4], 'keep the placed player; reject lock, loan, evolution, active squad, high rating and special cards');
         console.log('PASS actual FSU27.1 challenge hooks, unique buttons, real filters and smart-fill save without submit');
+        // Exercise the real FSU card renderer after a squad change, without re-entering SBC.
+        await page.evaluate(() => {
+            repositories.Item.unassigned = new Map();
+            repositories.Item.storage = new Map();
+            __sbcController.className = 'UTSBCSquadOverviewViewController';
+            const clubValues = repositories.Item.club.items.values;
+            repositories.Item.club.items.values = () => __inventory;
+            info.academy = [];
+            Object.assign(info.set, { card_price: true, card_meta: false });
+            const bodyType = events.getPlayerBodyType;
+            events.getPlayerBodyType = () => null;
+            const host = document.createElement('div');
+            host.className = 'ut-squad-pitch-view sbc'; host.id = 'sbc-price-regression';
+            document.body.append(host);
+            const palette = { getExpColorMap: () => ({ name: { r: 255, g: 255, b: 255 },
+                background: { r: 0, g: 0, b: 0 }, dividers: { r: 255, g: 255, b: 255 } }) };
+            const player = id => mockPlayer(id, { type: 'player', isLeftFoot: () => false,
+                getSkillMoves: () => 3, getWeakFoot: () => 3, isGK: () => false });
+            const mount = (id, index, cached = false) => {
+                const p = player(id), slot = document.createElement('div');
+                slot.className = 'ut-squad-slot-view'; slot.setAttribute('index', index);
+                host.append(slot);
+                const v = new UTPlayerItemView(); v.__root = document.createElement('div');
+                v.__root.className = 'small player item'; slot.append(v.__root);
+                // Fodder's real remote core owns this separate badge and may add it late.
+                const badge = document.createElement('div'); badge.className = 'fodder-gg-item-price';
+                badge.textContent = '1,000'; slot.append(badge);
+                if (cached) info.roster.data[id] = { n: 850, y: 0 };
+                else delete info.roster.data[id];
+                v.renderItem(p, palette);
+                return { v, p, slot, badge };
+            };
+            window.__priceRegression = { mount, player, palette, host, bodyType, clubValues,
+                originalLoad: events.loadPlayerInfo, originalPrice: events.getPriceForUrl, batches: [], pending: [] };
+            events.getPriceForUrl = ids => new Promise(resolve => {
+                __priceRegression.batches.push(ids);
+                __priceRegression.pending.push(() => resolve(Object.fromEntries(ids.filter(id => id !== 8103)
+                    .map(id => [id, { n: 1000 + id, y: 0 }]))));
+            });
+            __priceRegression.cards = [mount(8101, 0, true), mount(8102, 1), mount(8103, 2)];
+        });
+        await page.waitForFunction(() => document.querySelectorAll('#sbc-price-regression .fsu-PriceBar').length === 3, null, { timeout: 5000 })
+            .catch(error => { throw new Error(error.message + '\n' + errors.join('\n')); });
+        const priceBefore = await page.evaluate(() => ({
+            overlap: getComputedStyle(__priceRegression.cards[0].badge).display !== 'none',
+            requests: __priceRegression.batches.length
+        }));
+        assert.equal(priceBefore.overlap, false, 'a priced FSU card must not also show the Fodder price badge');
+        await page.waitForFunction(() => __priceRegression.batches.length === 1);
+        assert.deepEqual(await page.evaluate(() => __priceRegression.batches[0].slice().sort()), [8102, 8103], 'batch only the two missing versions');
+        await page.evaluate(() => __priceRegression.pending.shift()());
+        await page.waitForFunction(() => __priceRegression.cards[1].slot.querySelector('.fsu-PriceValue').textContent.replace(/\D/g, '') === '9102');
+        assert.deepEqual(await page.evaluate(() => __priceRegression.cards.map(c => ({
+            fsu: c.slot.querySelectorAll('.fsu-PriceBar').length,
+            fodder: getComputedStyle(c.badge).display !== 'none'
+        }))), [{ fsu: 1, fodder: false }, { fsu: 1, fodder: false }, { fsu: 1, fodder: true }], 'keep the alternate quote when FSU has no price');
+        await page.evaluate(() => {
+            const r = __priceRegression, c = r.cards[1];
+            c.v.renderItem(c.p, r.palette); c.v.renderItem(c.p, r.palette);
+            const lateBadge = c.badge.cloneNode(true); c.slot.append(lateBadge);
+        });
+        await page.waitForFunction(() => Array.from(__priceRegression.cards[1].slot.querySelectorAll('.fodder-gg-item-price')).every(b => getComputedStyle(b).display === 'none'));
+        assert.equal(await page.evaluate(() => __priceRegression.cards[1].slot.querySelectorAll('.fsu-PriceBar').length), 1);
+        assert.equal(await page.evaluate(() => __priceRegression.batches.length), 1, 'cached re-renders must not request prices again');
+        await page.evaluate(() => {
+            const r = __priceRegression;
+            r.reused = r.mount(8104, 3);
+            r.reused.v.renderItem(r.reused.p, r.palette);
+            r.reused.v.renderItem(r.reused.p, r.palette);
+        });
+        await page.waitForFunction(() => __priceRegression.batches.length === 2);
+        assert.deepEqual(await page.evaluate(() => __priceRegression.batches[1]), [8104], 'coalesce repeated renders of an uncached version');
+        await page.evaluate(() => {
+            const r = __priceRegression;
+            r.reused.p = r.player(8105); r.reused.v.renderItem(r.reused.p, r.palette);
+        });
+        await page.waitForFunction(() => __priceRegression.batches.length === 3);
+        await page.evaluate(() => __priceRegression.pending[1]());
+        await page.waitForFunction(() => __priceRegression.reused.slot.querySelector('.fsu-PriceValue').textContent.replace(/\D/g, '') === '9105');
+        await page.evaluate(() => __priceRegression.pending[0]());
+        await page.waitForFunction(() => info.roster.data[8104]?.n === 9104);
+        assert.equal(await page.evaluate(() => __priceRegression.reused.slot.querySelector('.fsu-PriceValue').textContent.replace(/\D/g, '')), '9105', 'late quote for the old card must not replace the current version');
+        await page.evaluate(() => {
+            const r = __priceRegression;
+            r.pending.length = 0;
+            r.removed = r.mount(8106, 4);
+        });
+        await page.waitForFunction(() => __priceRegression.batches.length === 4);
+        await page.evaluate(() => {
+            __priceRegression.removed.slot.remove();
+            __priceRegression.pending.shift()();
+        });
+        await page.waitForFunction(() => info.roster.data[8106]?.n === 9106);
+        assert.equal(await page.evaluate(() => __priceRegression.removed.slot.isConnected), false);
+        await page.evaluate(() => {
+            const r = __priceRegression;
+            info.set.card_price = false;
+            r.disabled = r.mount(8107, 5, true);
+        });
+        await page.waitForFunction(() => __priceRegression.disabled.v.__root.querySelector('span[p-id]'));
+        assert.equal(await page.evaluate(() => __priceRegression.disabled.slot.querySelectorAll('.fsu-PriceBar').length), 0, 'respect the card price display setting');
+        assert.equal(await page.evaluate(() => getComputedStyle(__priceRegression.disabled.badge).display !== 'none'), true);
+        await page.evaluate(() => {
+            const r = __priceRegression;
+            events.loadPlayerInfo = r.originalLoad; events.getPriceForUrl = r.originalPrice;
+            events.getPlayerBodyType = r.bodyType; r.host.remove();
+            repositories.Item.club.items.values = r.clubValues;
+            info.set.card_price = true;
+        });
+        console.log('PASS SBC live card price batching, no FSU/Fodder overlap, missing-price fallback, repeated renders, stale replies, removed cards and display setting');
         const hooks = await page.evaluate(() => UTSBCSquadOverviewViewController.prototype.initWithSBCSet.toString());
         await page.addScriptTag({ content: fsu });
         assert.equal(await page.evaluate(() => UTSBCSquadOverviewViewController.prototype.initWithSBCSet.toString()), hooks);
@@ -197,7 +347,8 @@ async function main() {
         assert.equal(await page.evaluate(() => __mockRuns.length), 7);
         assert.equal(await page.evaluate(() => __fodder.gallery.run.bought), 1);
         console.log('PASS original Gallery checkbox: missed cards wait a full 5 minutes, then bought cards leave the retry list');
-        await page.screenshot({ path: path.join(root, '.git/three-script-browser.png') });
+        await galleryBuying.run(page);
+        await page.screenshot({ path: path.join(root, '.gstack/three-script-browser.png') });
         assert.deepEqual(errors, []);
     } finally { await browser.close(); }
 }

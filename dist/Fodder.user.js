@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Fodder — SBC tools for FC 26
 // @namespace    https://fodder.gg
-// @version      0.5.6
-// @description  最新卡单独设置每个球员购买数量（1–20张）；保持新旧图鉴入口、原购买引擎及5分钟重试。非官方本地增强版。
+// @version      0.5.9
+// @description  收藏馆跨队自由选购（含已收藏卡）、最新卡数量购买（1–20张）；复用原购买引擎及5分钟重试。非官方本地增强版。
 // @match        https://www.ea.com/*
 // @run-at       document-idle
 // @noframes
@@ -102,7 +102,7 @@ function createFodderModalRetry(w) {
   'use strict';
   const d = w.document;
   const INTERVAL = 300000;
-  const VERSION = '0.5.6';
+  const VERSION = '0.5.9';
   let ready = false, failure = '', selectedModal = null, panel = null, enabled = false;
   let arm = null, active = null, ticker = null, observer = null, queued = false;
   let message = '加载循环功能…';
@@ -520,12 +520,61 @@ function patchFodderLatestBridge(source, parser, adapter) {
   return { source: output, adapter: { risk, preferences: adapter.preferences, factory: adapter.factory } };
 }
 
+/* Bind the existing Gallery loader and exact-version quote function. No new backend API.
+ * Match semantic anchors and AST structure; unknown or duplicate loaders fail closed.
+ */
+function patchFodderGalleryBridge(source, parser) {
+  const ast = parser.parse(source, { ecmaVersion: 'latest', sourceType: 'script' });
+  const loaders = [];
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 'FunctionDeclaration' && node.async && node.params.length === 2 &&
+        node.params.every(p => p.type === 'Identifier')) {
+      const body = source.slice(node.start, node.end);
+      if (body.includes('/api/gallery/') && body.includes('gallery: no prices') &&
+          body.includes('gallery: club not read, First Owner counts as unknown')) loaders.push(node);
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(walk); else if (value?.type) walk(value);
+    }
+  }
+  walk(ast);
+  if (loaders.length !== 1 || source.includes('window.__fodderGalleryBridge='))
+    throw new Error('收藏馆名单接口未唯一匹配，自由选购未接入');
+  const loader = loaders[0];
+  const prices = loader.body.body.filter(n => n.type === 'TryStatement' &&
+    n.handler && source.slice(n.handler.start, n.handler.end).includes('gallery: no prices'));
+  const assignment = prices[0]?.block.body[0]?.expression;
+  const call = assignment?.type === 'AssignmentExpression' && assignment.right?.type === 'AwaitExpression' && assignment.right.argument;
+  if (prices.length !== 1 || call?.type !== 'CallExpression' || call.callee.type !== 'Identifier' || call.arguments.length !== 1)
+    throw new Error('收藏馆原报价接口结构已变化，自由选购未接入');
+  const bridge = `\nwindow.__fodderGalleryBridge=Object.freeze({
+    load:async(cat,slug)=>{
+      const categories=window.__fodder?.gallery?.index;
+      const group=Array.isArray(categories)&&categories.filter(c=>c.slug===cat);
+      const matches=group&&group.length===1&&Array.isArray(group[0].sets)&&group[0].sets.filter(s=>s.slug===slug);
+      if(!matches||matches.length!==1)throw new Error("收藏馆球队未唯一匹配，请刷新后重试");
+      return ${loader.id.name}(cat,matches[0]);
+    },
+    prices:async(ids,platform)=>{
+      if(!Array.isArray(ids)||!ids.length||ids.length>200||ids.some(id=>!Number.isSafeInteger(id)||id<=0)||!['PC','PS'].includes(platform))throw new Error("收藏馆报价参数无效");
+      const key=platform==='PC'?'pc':'console',cache=window.__fodder.priceCache;
+      // Invalidate only these explicit versions, then use the core's own batched quote path.
+      if(cache)for(const id of ids)delete cache[key+':'+id];
+      return ${call.callee.name}(ids,key);
+    }
+  });\n`;
+  const output = source.slice(0, loader.end) + bridge + source.slice(loader.end);
+  parser.parse(output, { ecmaVersion: 'latest', sourceType: 'script' });
+  return { source: output };
+}
+
 /* Recent promo selector. Public FUTBIN catalogue -> exact EA resource ID -> native card and buyer.
  * This module never submits to Gallery, lists/sells cards, or implements transfer-market requests.
  */
 function createFodderLatestCards(w, channel) {
   'use strict';
-  const d = w.document, YEAR = 27, VERSION = '0.5.6';
+  const d = w.document, YEAR = 27, VERSION = '0.5.9';
   const MAX_PER_CARD = 20, MAX_TOTAL_COPIES = 100, RETRY_INTERVAL = 5 * 60 * 1000;
   const LIST_URL = `https://www.futbin.com/${YEAR}/squads`;
   const LIST_TTL = 10 * 60 * 1000, PRICE_TTL = 5 * 60 * 1000;
@@ -533,6 +582,9 @@ function createFodderLatestCards(w, channel) {
   let bridgeReady = false, bridgeError = '', picker = null, dialog = null, entry = null;
   let squads = [], listAt = 0, current = null, generation = 0, loading = false, listing = false;
   let variantFilter = 'all';
+  let mode = 'latest', galleryEntry = null, galleryCategory = '', selectedOnly = false;
+  const selections = { latest: { selected: new Map(), quantities: new Map(), current: null },
+    gallery: { selected: new Map(), quantities: new Map(), current: null } };
   let entities = new Map(), selected = new Map(), quantities = new Map(), cards = new Map(), views = [], buyViews = [];
   let currentRun = null, starting = false, statusTimer = null, entryTimer = null;
   const outstanding = new Map(), metadataCache = new Map(), batchCache = new Map();
@@ -757,9 +809,10 @@ function createFodderLatestCards(w, channel) {
     }
     return rows;
   }
-  const variantName = c => c.variant === 'holo' ? '签名／全息版' : '普通版';
+  const variantName = c => c.source === 'gallery' ? '收藏馆准确版本' : c.variant === 'holo' ? '签名／全息版' : '普通版';
   const purchaseName = c => `${c.name} · ${variantName(c)}`;
-  const filteredRows = () => (batchCache.get(current?.slug)?.rows || []).filter(c => variantFilter === 'all' || c.variant === variantFilter);
+  const filteredRows = () => selectedOnly ? Array.from(selected.values()) :
+    (batchCache.get(current?.slug)?.rows || []).filter(c => mode === 'gallery' || variantFilter === 'all' || c.variant === variantFilter);
   function saveCatalogue() { safe(() => w.localStorage.setItem(cacheKey, JSON.stringify({ at: listAt, squads }))); }
   function parsePlayer(data, row, plat) {
     let body; try { body = typeof data === 'string' ? JSON.parse(data) : data; } catch (_) { throw new Error('FUTBIN 球员接口未返回有效 JSON，暂不可购买'); }
@@ -875,11 +928,14 @@ function createFodderLatestCards(w, channel) {
   function updateSummary() {
     if (!picker) return;
     const banner = picker.querySelector('.fgnew-bridge-status');
-    if (banner) { banner.hidden = bridgeReady; setText(banner, bridgeError ? '新卡购买接口未接入：' + bridgeError + '。收藏馆原功能不受影响。' : '正在连接原购买组件，尚不能开始新卡购买…'); }
+    const ready = bridgeReady && (mode !== 'gallery' || !!w.__fodderGalleryBridge);
+    if (banner) { banner.hidden = ready; setText(banner, bridgeError ? '购买接口未接入：' + bridgeError + '。收藏馆原功能不受影响。' : '正在连接原购买组件，尚不能开始购买…'); }
     const list = Array.from(selected.values()).filter(eligible);
     const copies = list.reduce((sum, c) => sum + selectedQuantity(c.resourceId), 0);
     setText(picker.querySelector('.fgnew-count'), `已选 ${list.length} 种 · 合计 ${copies} 张 · 参考总价 ${format(list.reduce((sum, c) => sum + c.price * selectedQuantity(c.resourceId), 0))}`);
-    const b = picker.querySelector('.fgnew-purchase'); if (b) b.disabled = !list.length || loading || !bridgeReady;
+    const b = picker.querySelector('.fgnew-purchase'); if (b) b.disabled = !list.length || loading || !ready;
+    const review = picker.querySelector('.fgnew-review');
+    if (review) { setText(review, selectedOnly ? (mode === 'gallery' ? '返回球队名单' : '返回批次名单') : `查看已选（${selected.size}）`); review.classList.toggle('active', selectedOnly); }
     for (const n of picker.querySelectorAll('[data-fgnew-card]')) {
       const on = selected.has(Number(n.dataset.fgnewCard));
       n.classList.toggle('selected', on); n.setAttribute('aria-pressed', String(on));
@@ -918,7 +974,7 @@ function createFodderLatestCards(w, channel) {
       b.setAttribute('aria-label', `${purchaseName(c)} ${c.rating || ''} ${c.error || ''}`);
       b.append(el('span', 'fgnew-card-tick', '+'), nativeFace(c), el('span', 'fgnew-variant-label ' + (c.variant || 'normal'), variantName(c)), el('strong', 'fgnew-card-name', c.name));
       b.append(el('span', 'fgnew-card-price', c.price > 0 ? format(c.price) + ' 金币' : '暂无参考价'));
-      const hint = c.error || (c.status === 'ready' ? '点击卡面选择' : '正在核对游戏版本…');
+      const hint = c.error || (c.source === 'gallery' && c.collected ? '已收藏／曾拥有 · 仍可购买' : c.status === 'ready' ? '点击卡面选择' : '正在核对游戏版本…');
       b.append(el('span', 'fgnew-card-note', hint)); tile.append(b);
       const qtyBox = el('div', 'fgnew-card-qty');
       const label = el('span', 'fgnew-qty-label', '购买数量');
@@ -939,6 +995,7 @@ function createFodderLatestCards(w, channel) {
   function renderTabs() {
     const tabs = picker && picker.querySelector('.fgnew-batches'); if (!tabs) return;
     tabs.replaceChildren();
+    if (mode === 'gallery') { renderGallerySelectors(tabs); return; }
     for (const batch of squads) {
       const b = button('', () => { if (!loading && current !== batch) loadBatch(batch); }, 'fgnew-batch');
       b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', String(current?.slug === batch.slug));
@@ -948,6 +1005,10 @@ function createFodderLatestCards(w, channel) {
   }
   function renderVariantFilters() {
     const host = picker && picker.querySelector('.fgnew-variants'); if (!host) return;
+    host.hidden = mode === 'gallery';
+    if (mode === 'gallery') {
+      setText(picker.querySelector('.fgnew-select-visible'), selectedOnly ? '全选已显示可购卡' : '全选本队可购卡'); return;
+    }
     const rows = batchCache.get(current?.slug)?.rows || [];
     for (const b of host.querySelectorAll('[data-variant-filter]')) {
       const value = b.dataset.variantFilter;
@@ -957,6 +1018,104 @@ function createFodderLatestCards(w, channel) {
       b.setAttribute('aria-pressed', String(variantFilter === value)); b.disabled = loading;
     }
     setText(picker.querySelector('.fgnew-select-visible'), variantFilter === 'all' ? '全选本批可购卡' : '全选当前版本可购卡');
+  }
+  function galleryScope() {
+    const persona = w.services.User.getUser().getSelectedPersona();
+    const id = persona?.id ?? persona?.personaId;
+    if (id == null || String(id) === '') throw new Error('无法确认收藏馆账号，请重新登录后重试');
+    return String(id) + ':' + platform();
+  }
+  function galleryGroups() {
+    if (!w.__fodderGalleryBridge) throw new Error('收藏馆自由选购接口未接入；请刷新页面或更新适配，原收藏馆功能不受影响');
+    const groups = w.__fodder?.gallery?.index;
+    if (!Array.isArray(groups) || !groups.length || groups.some(g => !g || typeof g.slug !== 'string' ||
+        !Array.isArray(g.sets) || g.sets.some(s => !s || typeof s.slug !== 'string')))
+      throw new Error('收藏馆名单尚未就绪，请先打开原收藏馆，再重试');
+    return groups;
+  }
+  function galleryBatch(group, set) {
+    return { slug: 'gallery:' + JSON.stringify([group.slug, set.slug]), cat: group.slug,
+      setSlug: set.slug, name: String(set.name || set.slug) };
+  }
+  function renderGallerySelectors(host) {
+    let groups; try { groups = galleryGroups(); } catch (_) { return; }
+    const group = groups.find(g => g.slug === galleryCategory) || groups[0];
+    galleryCategory = group.slug;
+    const addSelect = (label, cls, rows, value, changed) => {
+      const wrap = el('label', 'fgnew-gallery-label', label), select = el('select', cls);
+      select.setAttribute('aria-label', label);
+      for (const row of rows) { const option = el('option', '', String(row.name || row.slug)); option.value = row.slug; select.append(option); }
+      select.value = value; select.disabled = loading;
+      select.addEventListener('change', () => changed(select.value)); wrap.append(select); host.append(wrap);
+    };
+    addSelect('分类', 'fgnew-gallery-category', groups, group.slug, slug => {
+      const next = groups.find(g => g.slug === slug); galleryCategory = slug; selectedOnly = false;
+      if (next?.sets.length) loadGallerySet(galleryBatch(next, next.sets[0])); else { current = null; renderTabs(); picker.querySelector('.fgnew-grid').replaceChildren(); showMessage('该分类暂无球队名单。'); }
+    });
+    addSelect('球队 / 套装', 'fgnew-gallery-set', group.sets, current?.cat === group.slug ? current.setSlug : '', slug => {
+      const set = group.sets.find(s => s.slug === slug); if (set) { selectedOnly = false; loadGallerySet(galleryBatch(group, set)); }
+    });
+  }
+  function galleryMarketable(item, quote) {
+    if (!item || !Number.isFinite(Number(quote)) || Number(quote) <= 0) return false;
+    let range = null;
+    try { range = item.getPriceLimits?.(); } catch (_) {}
+    // EA concept items default itemPriceLimits to null. This is missing listing metadata,
+    // not proof of a reward/unmarketable version; the core already supplied an exact quote.
+    if (!range || range.minimum == null || range.maximum == null) return true;
+    const min = Number(range.minimum), max = Number(range.maximum);
+    return Number.isFinite(min) && Number.isFinite(max) && min > 0 && max >= min;
+  }
+  async function loadGallerySet(batch) {
+    if (loading || !picker) return;
+    const gen = ++generation; current = batch; galleryCategory = batch.cat; loading = true;
+    renderTabs(); renderCards(); updateSummary();
+    try {
+      assertYear(); const plat = platform(), scope = galleryScope();
+      if (selections.gallery.scope !== scope) { selected.clear(); quantities.clear(); selections.gallery.scope = scope; }
+      showMessage(`读取 ${batch.name}；已收藏／曾拥有的球员也可选择…`);
+      const set = await w.__fodderGalleryBridge.load(batch.cat, batch.setSlug);
+      if (!picker || gen !== generation) return;
+      if (!Array.isArray(set?.cards) || set.cards.length > 2000 || set.cards.some(c => !Number.isSafeInteger(c.id) || c.id <= 0) ||
+          new Set(set.cards.map(c => c.id)).size !== set.cards.length) throw new Error('收藏馆准确版本名单结构已变化，已停止读取');
+      const rows = set.cards.map(c => ({ source: 'gallery', resourceId: c.id, name: String(c.name || c.id), rating: c.rating,
+        collected: c.collected === true, batch: batch.slug, scope, status: 'loading', error: '' }));
+      batchCache.set(batch.slug, { rows }); renderCards();
+      // Refresh the current team and every selected version across other teams together.
+      const all = new Map([...selected.values(), ...rows].map(c => [c.resourceId, c]));
+      const ids = Array.from(all.keys()), quotes = {};
+      for (let i = 0; i < ids.length; i += 200) {
+        Object.assign(quotes, await w.__fodderGalleryBridge.prices(ids.slice(i, i + 200), plat));
+        if (!picker || gen !== generation) return;
+      }
+      const incoming = ids.length ? await conceptItems(ids) : new Map();
+      if (!picker || gen !== generation) return;
+      if (galleryScope() !== scope) throw new Error('账号或平台已改变，请重新打开自由选购');
+      const updated = new Map();
+      for (const [id, old] of all) {
+        const item = incoming.get(id);
+        const price = Number(quotes[id]) || 0;
+        const market = galleryMarketable(item, price);
+        const c = Object.assign({}, old, { price, market, platform: plat, priceAt: Date.now(), scope,
+          status: item ? 'ready' : 'error', rating: item?.rating ?? old.rating,
+          error: !item ? '游戏未匹配到同一卡片编号，暂不可购买' : !Number.isFinite(price) || price <= 0
+            ? '暂无准确版本参考价，暂不可购买' : !market ? '该版本的价格范围明确不可交易，暂不可购买' : '' });
+        if (item) entities.set(id, item); else entities.delete(id);
+        cards.set(id, c); updated.set(id, c);
+        if (selected.has(id)) { if (eligible(c)) selected.set(id, c); else removeSelected(id); }
+      }
+      batchCache.set(batch.slug, { rows: rows.map(c => updated.get(c.resourceId)) });
+      renderCards(); showMessage(`${batch.name} · ${rows.length} 张 · ${rows.filter(c => eligible(updated.get(c.resourceId))).length} 张可选。切换球队会保留选择；买到后留在未分配区，不提交收藏馆。`);
+    } catch (error) { if (picker && gen === generation) showMessage(error.message, true); }
+    finally { if (gen === generation) { loading = false; renderTabs(); renderVariantFilters(); updateSummary(); } }
+  }
+  function loadGallery() {
+    try {
+      const groups = galleryGroups(), group = groups.find(g => g.slug === current?.cat) || groups.find(g => g.sets.length);
+      if (!group) throw new Error('收藏馆暂无球队名单');
+      const set = group.sets.find(s => s.slug === current?.setSlug) || group.sets[0];
+      loadGallerySet(galleryBatch(group, set));
+    } catch (error) { showMessage(error.message, true); updateSummary(); }
   }
   async function loadBatch(batch, force = false) {
     if (loading || !picker) return;
@@ -1060,23 +1219,37 @@ function createFodderLatestCards(w, channel) {
   }
   function closePicker() {
     if (dialog) { closeDialog(); if (dialog) return; }
+    selections[mode].current = current;
     generation++; loading = false; listing = false;
     if (picker) picker.remove(); picker = null; destroyViews();
     if (entry) { entry.classList.remove('fgnew-entry-open'); entry.setAttribute('aria-expanded', 'false'); }
+    if (galleryEntry) { galleryEntry.classList.remove('fgnew-entry-open'); galleryEntry.setAttribute('aria-expanded', 'false'); }
   }
-  function openPicker() {
+  function openPicker(nextMode = 'latest') {
     if (picker) return;
     if (nativeBusy()) { w.alert('当前已有购买任务，请先停止或等待它结束，再打开最新卡。'); return; }
+    mode = nextMode; selectedOnly = false;
+    ({ selected, quantities, current } = selections[mode]);
+    if (mode === 'gallery') {
+      try {
+        if (selections.gallery.scope !== galleryScope()) { selected.clear(); quantities.clear(); current = null; }
+      } catch (error) { w.alert(error.message); return; }
+    }
+    const gallery = mode === 'gallery', titleText = gallery ? '自由选购' : '最新卡';
     installStyles();
     picker = el('div', 'fgnew-overlay'); picker.id = 'fgnew-picker-overlay';
     const shell = el('section', 'fgnew-shell'); shell.setAttribute('role', 'dialog'); shell.setAttribute('aria-modal', 'true');
-    shell.setAttribute('aria-label', '最新卡');
+    shell.setAttribute('aria-label', titleText);
     const header = el('header', 'fgnew-header');
     const topTabs = el('div', 'fgnew-mode-tabs');
-    topTabs.append(button('收藏馆', closePicker), button('最新卡', null, 'active')); header.append(topTabs, button('关闭', closePicker));
+    const switchTo = target => { closePicker(); if (!picker) openPicker(target); };
+    topTabs.append(button('收藏馆', closePicker), button('自由选购', () => switchTo('gallery'), gallery ? 'active' : ''),
+      button('最新卡', () => switchTo('latest'), gallery ? '' : 'active')); header.append(topTabs, button('关闭', closePicker));
     const intro = el('div', 'fgnew-intro');
-    const title = el('div'); title.append(el('h2', '', '最新卡'), el('p', '', '最近3批活动阵容 · 普通版与签名／全息版均可选择'));
-    intro.append(title, link('FUTBIN 来源', LIST_URL));
+    const title = el('div'); title.append(el('h2', '', titleText), el('p', '', gallery
+      ? '收藏馆全部球队 · 跨队累计选择 · 已收藏／曾拥有也可购买'
+      : '最近3批活动阵容 · 普通版与签名／全息版均可选择'));
+    intro.append(title); if (!gallery) intro.append(link('FUTBIN 来源', LIST_URL));
     const tabs = el('div', 'fgnew-batches'); tabs.setAttribute('role', 'tablist');
     const tools = el('div', 'fgnew-tools');
     tools.append(button('全选本批可购卡', () => {
@@ -1088,7 +1261,12 @@ function createFodderLatestCards(w, channel) {
         selected.set(c.resourceId, c); quantities.set(c.resourceId, 1);
       }
       updateSummary();
-    }, 'fgnew-select-visible'), button('清空选择', () => { selected.clear(); quantities.clear(); updateSummary(); }), button('刷新批次 / 价格', () => loadList(true)));
+    }, 'fgnew-select-visible'), button('查看已选', () => {
+      selectedOnly = !selectedOnly; renderCards();
+      showMessage(selectedOnly ? '以下为已选球员，可逐张调整数量或取消选择。' : '点击卡面选择球员，切换名单会保留已选球员。');
+    }, 'fgnew-review'),
+      button('清空选择', () => { selected.clear(); quantities.clear(); if (selectedOnly) renderCards(); else updateSummary(); }),
+      button(gallery ? '刷新球队 / 价格' : '刷新批次 / 价格', () => gallery ? loadGallery() : loadList(true)));
     const variants = el('div', 'fgnew-variants'); variants.setAttribute('role', 'group'); variants.setAttribute('aria-label', '卡片版本筛选');
     for (const type of ['all', 'normal', 'holo']) {
       const b = button('', () => { if (loading) return; variantFilter = type; renderCards(); }, 'fgnew-variant-filter');
@@ -1102,6 +1280,8 @@ function createFodderLatestCards(w, channel) {
     shell.append(header, intro, tabs, variants, tools, message, bridgeBanner, grid, footer); picker.append(shell); d.body.append(picker);
     renderVariantFilters();
     if (entry) { entry.classList.add('fgnew-entry-open'); entry.setAttribute('aria-expanded', 'true'); }
+    if (galleryEntry) { galleryEntry.classList.toggle('fgnew-entry-open', gallery); galleryEntry.setAttribute('aria-expanded', String(gallery)); }
+    if (gallery && entry) { entry.classList.remove('fgnew-entry-open'); entry.setAttribute('aria-expanded', 'false'); }
     picker.addEventListener('click', e => { if (e.target === picker) closePicker(); });
     picker.addEventListener('keydown', e => {
       // Keep the existing site's Enter shortcuts from starting a separate unrelated operation.
@@ -1109,7 +1289,7 @@ function createFodderLatestCards(w, channel) {
       else if (e.key === 'Enter' || e.key === ' ') e.stopPropagation();
     });
     if (!bridgeReady && bridgeError) showMessage('新卡购买接口未接入：' + bridgeError, true);
-    loadList(false);
+    if (gallery) loadGallery(); else loadList(false);
   }
   function closeDialog() {
     if (!dialog) return;
@@ -1187,11 +1367,13 @@ function createFodderLatestCards(w, channel) {
     if (totalCopies > MAX_TOTAL_COPIES) { showMessage('本次购买数量超过100张，请减少数量。', true); return; }
     const multi = targets.some(c => c.need > 1);
     if (targets.some(c => c.platform !== platform())) { showMessage('价格平台已改变，请先刷新价格', true); return; }
-    if (targets.some(c => Date.now() - c.priceAt > PRICE_TTL)) { showMessage('所选卡的参考价格已超过5分钟，请先点击“刷新批次 / 价格”后重新确认', true); return; }
+    if (targets.some(c => c.source === 'gallery' && c.scope !== galleryScope())) { showMessage('账号已改变，请重新打开自由选购', true); return; }
+    if (targets.some(c => Date.now() - c.priceAt > PRICE_TTL)) { showMessage('所选卡的参考价格已超过5分钟，请先刷新价格后重新确认', true); return; }
     const ownDialog = dialog = el('div', 'fgnew-overlay fgnew-buy-overlay'); ownDialog.id = 'fgnew-buy-overlay';
     const modal = el('section', 'fgnew-shell fgnew-buy-shell'); modal.dataset.fgLatestBuy = 'true';
-    modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true'); modal.setAttribute('aria-label', '最新卡购买');
-    const head = el('header', 'fgnew-header'); head.append(el('h2', '', '最新卡购买'));
+    const purchaseTitle = mode === 'gallery' ? '自由选购购买' : '最新卡购买';
+    modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true'); modal.setAttribute('aria-label', purchaseTitle);
+    const head = el('header', 'fgnew-header'); head.append(el('h2', '', purchaseTitle));
     const body = el('div', 'fgnew-buy-body'), tableWrap = el('div', 'fgnew-buy-table');
     const table = el('table'); table.innerHTML = '<thead><tr><th>总评</th><th>球员</th><th>状态</th><th>价格</th></tr></thead>';
     const tbody = el('tbody'); table.append(tbody); tableWrap.append(table);
@@ -1378,12 +1560,14 @@ function createFodderLatestCards(w, channel) {
         ownDialog.style.zIndex = ''; if (dialog === ownDialog && picker) picker.style.zIndex = '';
         if (!consent) return;
         if (dialog !== ownDialog || !ownDialog.isConnected) return;
+        if (targets.some(c => c.source === 'gallery' && c.scope !== galleryScope())) throw new Error('账号或平台已改变，请重新选卡');
         if (targets.some(c => Date.now() - c.priceAt > PRICE_TTL)) throw new Error('参考价格已过期，请关闭窗口、刷新价格并重新确认');
         const frozenPrefs = Object.freeze(Object.assign({}, prefs));
         const task = purchaseTask = { running:true, stopping:false, stopped:null, stop:() => stopTask() };
         currentRun = task;
         ownTimer = statusTimer = w.setInterval(paintRun, 1000);
         while (!task.stopping && dialog === ownDialog) {
+          if (targets.some(c => c.source === 'gallery' && c.scope !== galleryScope())) throw new Error('账号或平台已改变，已停止后续购买');
           const stillNeeded = targets.filter(c => (boughtCounts.get(c.resourceId) || 0) < c.need);
           if (!stillNeeded.length) break;
           round++; purchasedThisRound = new Set();
@@ -1455,12 +1639,12 @@ function createFodderLatestCards(w, channel) {
   function findGalleryTabRow() {
     // Fodder's Gallery labels changed in Oct 2026:
     // 分类 / 代币 / 分数 / 套装 -> 全部套装 / 获取代币 / 提升分数 / 完成套装.
-    // Keep both wordings and their English/Traditional-Chinese equivalents. The last
-    // section, rather than the top-level "图鉴" heading, anchors our custom tab.
+    // The current core has only the first three tabs; Complete Sets moved off the row.
+    // Anchor after the last recognized tab, keeping the old four-tab layout supported.
     const types = [
       /^(?:分类|分類|Categories|全部套装|全部套裝|All\s+Sets?)$/i,
       /^(?:代币|代幣|Tokens?|获取代币|獲取代幣|Earn\s+Tokens?|Get\s+Tokens?)$/i,
-      /^(?:分数|分數|Grades?|提升分数|提升分數|Raise\s+Grades?|Improve\s+Grades?)$/i,
+      /^(?:分数|分數|Grades?|提升分数|提升分數|Raise\s+Grades?|Improve\s+Grades?|Increase\s+Score)$/i,
       /^(?:套装|套裝|Sets?|完成套装|完成套裝|Complete\s+Sets?)$/i
     ];
     const kind = n => types.findIndex(re => re.test(txt(n)));
@@ -1479,10 +1663,10 @@ function createFodderLatestCards(w, channel) {
     for (const n of candidates) {
       for (let row = n.parentElement, depth = 0; row && row !== d.body && depth < 6; row = row.parentElement, depth++) {
         const children = candidates.filter(x => row.contains(x));
-        if (new Set(children.map(kind)).size < 3) continue;
+        const kinds = new Set(children.map(kind));
+        if (![0, 1, 2].every(k => kinds.has(k))) continue;
         if (row.getBoundingClientRect().height > 120) break;
-        const last = children.find(x => kind(x) === 3);
-        if (!last) continue;
+        const last = children.find(x => kind(x) === (kinds.has(3) ? 3 : 2));
         const native = last.closest('button,[role="tab"],[role="button"],a') || last;
         let slot = native;
         while (slot.parentElement && slot.parentElement !== row) slot = slot.parentElement;
@@ -1495,7 +1679,7 @@ function createFodderLatestCards(w, channel) {
   function attachEntry() {
     if (!d.body || !w.services?.Item || !w.repositories) return;
     const hit = findGalleryTabRow();
-    if (!hit) { if (entry) entry.hidden = true; return; }
+    if (!hit) { if (entry) entry.hidden = true; if (galleryEntry) galleryEntry.hidden = true; return; }
     if (!entry) {
       entry = button('最新卡', event => { event.stopPropagation(); openPicker(); }, 'fgnew-entry');
       entry.id = 'fgnew-latest-tab'; entry.title = '最近3批活动阵容，含普通版及签名／全息版';
@@ -1512,15 +1696,25 @@ function createFodderLatestCards(w, channel) {
       entry.style.removeProperty('left'); entry.style.removeProperty('top');
     }
     entry.hidden = false;
+    if (!galleryEntry) {
+      galleryEntry = button('自由选购', event => { event.stopPropagation(); openPicker('gallery'); }, 'fgnew-entry');
+      galleryEntry.id = 'fgnew-gallery-tab'; galleryEntry.title = '跨队选择收藏馆球员，含已收藏／曾拥有的准确版本';
+      galleryEntry.setAttribute('aria-haspopup', 'dialog'); galleryEntry.setAttribute('aria-controls', 'fgnew-picker-overlay');
+      galleryEntry.setAttribute('aria-expanded', 'false');
+      galleryEntry.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') event.stopPropagation(); });
+    }
+    if (galleryEntry.parentElement !== hit.row || galleryEntry.previousElementSibling !== entry) entry.insertAdjacentElement('afterend', galleryEntry);
+    galleryEntry.hidden = false;
   }
   function installStyles() {
     if (d.getElementById('fgnew-styles')) return;
     const style = el('style'); style.id = 'fgnew-styles';
     style.textContent = `
-#fgnew-latest-tab{position:relative;inset:auto;display:inline-flex;align-items:center;justify-content:center;align-self:stretch;flex:0 0 auto;vertical-align:middle;box-sizing:border-box;margin:0 0 0 8px;padding:8px 4px;min-height:0;height:auto;width:auto;font-family:inherit;font-size:14px;font-weight:600;line-height:1.4;background:transparent;color:inherit;opacity:.7;border:0;border-bottom:2px solid transparent;border-radius:0;box-shadow:none;white-space:nowrap;cursor:pointer;text-transform:none}
-#fgnew-latest-tab:hover,#fgnew-latest-tab:focus-visible,#fgnew-latest-tab.fgnew-entry-open{color:#e9edf4;opacity:1;border-bottom-color:#16c79a;background:transparent}
+#fgnew-latest-tab,#fgnew-gallery-tab{position:relative;inset:auto;display:inline-flex;align-items:center;justify-content:center;align-self:stretch;flex:0 0 auto;vertical-align:middle;box-sizing:border-box;margin:0 0 0 8px;padding:8px 4px;min-height:0;height:auto;width:auto;font-family:inherit;font-size:14px;font-weight:600;line-height:1.4;background:transparent;color:inherit;opacity:.7;border:0;border-bottom:2px solid transparent;border-radius:0;box-shadow:none;white-space:nowrap;cursor:pointer;text-transform:none}
+#fgnew-latest-tab:hover,#fgnew-latest-tab:focus-visible,#fgnew-latest-tab.fgnew-entry-open,#fgnew-gallery-tab:hover,#fgnew-gallery-tab:focus-visible,#fgnew-gallery-tab.fgnew-entry-open{color:#e9edf4;opacity:1;border-bottom-color:#16c79a;background:transparent}
+.fgnew-gallery-label{display:flex;align-items:center;gap:8px;min-width:0;flex:1;font-size:12px;white-space:nowrap}.fgnew-gallery-label select{min-width:0;flex:1;width:100%;padding:8px;color:#e9edf4;background:#172536;border:1px solid #435165;border-radius:6px}
 .fgnew-variants{display:flex;gap:8px;padding:5px 22px;flex:none;flex-wrap:wrap}.fgnew-variant-filter.fgnew-btn{font-size:12px;padding:4px 12px;min-height:28px;border-radius:18px}.fgnew-variant-label{font-size:10px;line-height:16px;color:#a2b2c4;border:1px solid #435165;border-radius:4px;padding:1px 8px}.fgnew-variant-label.holo{color:#ccbbff;border-color:#8879bd;background:#6b52a322}.fgnew-message{white-space:pre-line}.fgnew-empty{grid-column:1/-1;color:#9eafc0;font-size:13px;padding:24px;text-align:center}
-#fgnew-latest-tab[hidden]{display:none!important}
+#fgnew-latest-tab[hidden],#fgnew-gallery-tab[hidden]{display:none!important}
 .fgnew-overlay{position:fixed;inset:0;z-index:100000;display:flex;align-items:center;justify-content:center;background:rgba(2,8,15,.75);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;color:#e9edf4}
 .fgnew-overlay *{box-sizing:border-box}.fgnew-overlay [hidden]{display:none!important}
 .fgnew-shell{width:min(1120px,95vw);height:min(900px,92vh);max-height:94vh;background:linear-gradient(130deg,#171d29,#0e1d25);border:1px solid #3b4656;border-radius:20px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 24px 80px #0007}
@@ -7957,6 +8151,8 @@ return module.exports;
         selected = extra.source;
         console.info('[Fodder 最新卡] 原购买接口已接入', extra.adapter);
       } catch (error) { latest.unavailable(error); }
+      try { selected = patchFodderGalleryBridge(selected, fg5mParser).source; }
+      catch (error) { console.warn('[Fodder 自由选购]', error); }
     } catch (error) { retry.unavailable(error); }
     // Execute the selected core ONCE. Never re-evaluate it after a runtime error.
     (0, eval)(selected);

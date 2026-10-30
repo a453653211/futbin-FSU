@@ -8,52 +8,92 @@ events.highValueScope = () => {
     if (platform !== info.base.platform) throw new Error('账号平台正在切换，请刷新后再扫描。');
     return { platform, key: `27:${persona.id}:${persona.sku}:${platform}` };
 };
-events.highValueGet = url => new Promise((resolve, reject) => {
-    GM_xmlhttpRequest({ method: 'GET', url, timeout: 20000,
-        onload: result => result.status === 200 ? resolve(result.responseText) : reject(new Error(`FUTBIN 读取失败（${result.status}）。`)),
-        onerror: () => reject(new Error('FUTBIN 网络请求失败。')),
-        ontimeout: () => reject(new Error('FUTBIN 请求超时。')) });
+events.highValueWait = (ms, signal) => new Promise((resolve, reject) => {
+    let timer;
+    const finish = error => {
+        clearTimeout(timer); signal?.removeEventListener('abort', abort);
+        error ? reject(error) : resolve();
+    };
+    const abort = () => finish(new Error('任务已停止。'));
+    if (signal?.aborted) return abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    timer = setTimeout(() => finish(), Math.max(0, ms));
 });
-events.highValueBaselines = async platform => {
+events.highValueGet = (url, signal) => new Promise((resolve, reject) => {
+    let handle, timer, done = false;
+    const finish = (error, result) => {
+        if (done) return;
+        done = true; clearTimeout(timer); signal?.removeEventListener('abort', abort);
+        error ? reject(error) : resolve(result);
+    };
+    const cancelRead = () => { try { handle?.abort?.(); } catch { /* already settled */ } };
+    const abort = () => { finish(new Error('任务已停止。')); cancelRead(); };
+    if (signal?.aborted) return abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    const timeout = () => { finish(new Error('FUTBIN 请求超时。')); cancelRead(); };
+    // Do not rely solely on the userscript manager delivering its timeout callback.
+    timer = setTimeout(timeout, 20000);
     try {
-        const html = await events.highValueGet(FsuHighValue.source);
+        handle = GM_xmlhttpRequest({ method: 'GET', url, timeout: 20000,
+            onload: result => result.status === 200 ? finish(null, result.responseText) : finish(new Error(`FUTBIN 读取失败（${result.status}）。`)),
+            onerror: () => finish(new Error('FUTBIN 网络请求失败。')),
+            ontimeout: timeout, onabort: () => finish(new Error('FUTBIN 读取已取消。')) });
+        if (signal?.aborted) cancelRead();
+    } catch (error) { finish(error); }
+});
+events.highValueBaselines = async (platform, signal) => {
+    try {
+        const html = await events.highValueGet(FsuHighValue.source, signal);
         const prices = FsuHighValue.parseCheapest(new DOMParser().parseFromString(html, 'text/html'), platform);
         return { source: FsuHighValue.source, year: 27, at: Date.now(), platforms: { [platform]: prices }, manual: false };
     } catch (error) {
+        if (signal?.aborted) throw error;
         let saved;
         try { saved = JSON.parse(GM_getValue(FsuHighValue.snapshotKey, 'null')); } catch { /* invalid cache is unavailable */ }
         if (FsuHighValue.fresh(saved, platform)) return { ...saved, manual: true };
         throw new Error(`${error.message} 请打开 FUTBIN 页面完成验证，点击“同步最低价到 FSU”后返回 EA 再点一键添加。`);
     }
 };
-events.highValuePrices = (platform, check) => {
-    const cache = new Map();
+events.highValuePrices = (platform, check, { items = [], signal, onProgress = () => {} } = {}) => {
+    const cache = new Map(), targets = new Map();
+    for (const item of items) {
+        if (!targets.has(item.rating)) targets.set(item.rating, new Set());
+        targets.get(item.rating).add(String(Number(item.definitionId)));
+    }
     let lastRead = 0;
-    return async item => {
-        const params = new URLSearchParams({ platform: platform === 'pc' ? 'PC' : 'PS', nation: item.nationId,
-            league: item.leagueId, club: item.teamId, rating: `${item.rating}-${item.rating}`, sort: 'rating', order: 'desc' });
+    const load = async rating => {
+        const params = new URLSearchParams({ platform: platform === 'pc' ? 'PC' : 'PS',
+            rating: `${rating}-${rating}`, sort: 'rating', order: 'desc' });
         const key = params.toString();
-        if (!cache.has(key)) {
-            const rows = [], seen = new Set();
-            for (let page = 1; page <= 10; page++) {
-                check();
-                const delay = Math.max(0, lastRead + 500 - Date.now());
-                if (delay) await new Promise(resolve => setTimeout(resolve, delay));
-                check(); lastRead = Date.now();
-                const raw = await events.highValueGet(`https://www.futbin.org/futbin/api/27/getFilteredPlayers?${key}&page=${page}`);
-                check();
-                const data = JSON.parse(raw);
-                if (!Array.isArray(data.data)) throw new Error('FUTBIN 球员数据结构已改变。');
-                if (!data.data.length) break;
-                const signature = data.data.map(row => `${row.ID}:${row.resource_id}`).join('|');
-                if (seen.has(signature)) break;
-                seen.add(signature); rows.push(...data.data);
-                // Do not infer the page size: stop only on an empty page or a repeated page.
-                if (page === 10) throw new Error('FUTBIN 球员分页过多，无法确认完整版本。');
+        const rows = [], seen = new Set(), wanted = targets.has(rating) ? new Set(targets.get(rating)) : null;
+        for (let page = 1; page <= 100; page++) {
+            check();
+            const delay = Math.max(0, lastRead + 500 - Date.now());
+            if (delay) await events.highValueWait(delay, signal);
+            check(); lastRead = Date.now(); onProgress(rating, page);
+            const raw = await events.highValueGet(`https://www.futbin.org/futbin/api/27/getFilteredPlayers?${key}&page=${page}`, signal);
+            check();
+            const data = JSON.parse(raw);
+            if (!Array.isArray(data.data)) throw new Error('FUTBIN 球员数据结构已改变。');
+            if (!data.data.length) break;
+            const signature = data.data.map(row => `${row.ID}:${row.resource_id ?? row.Player_Resource}`).join('|');
+            if (seen.has(signature)) break;
+            seen.add(signature); rows.push(...data.data);
+            for (const row of data.data) {
+                if (Number(row.Player_Rating ?? row.rating) === rating)
+                    wanted?.delete(String(Number(row.Player_Resource ?? row.resource_id)));
             }
-            cache.set(key, { data: rows });
+            // Ratings share one table. Never substitute the rating baseline for a card's own price.
+            // Stop once every requested version is present; otherwise continue without guessing page size.
+            if (wanted && !wanted.size) break;
+            if (page === 100) throw new Error(`FUTBIN ${rating} 分球员分页过多，无法确认完整版本。`);
         }
-        return FsuHighValue.exactPrice(cache.get(key), item.definitionId, item.rating, platform);
+        return { data: rows };
+    };
+    return async item => {
+        if (!cache.has(item.rating)) cache.set(item.rating, load(item.rating).catch(error => { cache.delete(item.rating); throw error; }));
+        const data = await cache.get(item.rating); check();
+        return FsuHighValue.exactPrice(data, item.definitionId, item.rating, platform);
     };
 };
 events.highValueInventory = async (check, request) => {
@@ -78,14 +118,17 @@ events.highValueInventory = async (check, request) => {
     if (items.size !== count) throw new Error('俱乐部球员数量发生变化，请重新扫描。');
     check(); return [...items.values()];
 };
-events.highValueObserve = create => new Promise((resolve, reject) => {
+events.highValueObserve = (create, signal) => new Promise((resolve, reject) => {
     const owner = {}; let observable, done = false;
     const finish = (error, result) => {
         if (done) return;
-        done = true; clearTimeout(timer); observable?.unobserve(owner);
+        done = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); observable?.unobserve(owner);
         error ? reject(error) : resolve(result);
     };
+    const abort = () => finish(new Error('任务已停止。'));
     const timer = setTimeout(() => finish(new Error('EA 请求超时，已停止；如正在移卡，请核对转会列表后重新扫描。')), 25000);
+    if (signal?.aborted) return abort();
+    signal?.addEventListener('abort', abort, { once: true });
     try {
         observable = create();
         observable.observe(owner, (sender, result) => result?.success ? finish(null, result)
@@ -116,10 +159,14 @@ events.highValueOpen = async () => {
     const link = document.createElement('a'); link.textContent = '打开 FUTBIN 同步最低价'; link.hidden = true;
     link.href = FsuHighValue.source; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.style.color = '#d7fa36'; panel.append(link);
     document.body.append(panel);
-    let stopped = false, scope, data, active = new Set(), lastRequest = 0, acquired = false, moved = 0, skipped = 0;
+    let stopped = false, scope, data, active = new Set(), lastRequest = 0, acquired = false, moved = 0, skipped = 0, moving = false;
+    const cancellation = new AbortController(), signal = cancellation.signal;
     let protectedCount = 0, unknown = 0, missingBase = new Set();
     const locked = () => new Set(info.lock.map(String));
-    stop.onclick = () => { stopped = true; stop.disabled = true; status.textContent = '正在停止，已发送的请求完成后不再继续。'; };
+    stop.onclick = () => {
+        stopped = true; panel.remove(); cancellation.abort();
+        if (moving) services.Notification.queue(['已停止。已发送的移卡仍需核对结果，期间不会开始新任务。', UINotificationType.NEGATIVE]);
+    };
     const check = () => {
         events.smartSbcCheckIdle(true);
         if (info.run.smartSbc || info.base.savesquad) throw new Error('请先停止智能 SBC / 阵容保存任务。');
@@ -127,13 +174,14 @@ events.highValueOpen = async () => {
         if (scope && events.highValueScope().key !== scope.key) throw new Error('账号或平台已改变，请重新点击一键添加。');
         if (services.User.getUser()?.tradeAccess !== TradeAccessLevel.ALLOWED) throw new Error('当前账号没有转会市场访问权限。');
     };
-    const request = async create => {
+    const request = async (create, mutation = false) => {
         check();
         const delay = Math.max(0, lastRequest + 5000 - Date.now());
-        if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+        if (delay) await events.highValueWait(delay, signal);
         check();
-        try { const result = await events.highValueObserve(create); check(); return result; }
-        finally { lastRequest = Date.now(); }
+        moving = mutation;
+        try { const result = await events.highValueObserve(create, mutation ? undefined : signal); check(); return result; }
+        finally { moving = false; lastRequest = Date.now(); }
     };
     const readActive = async () => {
         const summary = (await request(() => services.Squad.requestSquadList())).data;
@@ -165,11 +213,14 @@ events.highValueOpen = async () => {
         if (!navigator.locks?.request) throw new Error('浏览器不支持转会任务单实例锁。');
         await navigator.locks.request(`fsu-auto-bid:${scope.key}`, { ifAvailable: true }, async lease => {
             if (!lease) throw new Error('其他转会任务正在运行，请先停止。');
-            status.textContent = '读取 FUTBIN 同分最低价…'; data = await events.highValueBaselines(scope.platform); check();
+            status.textContent = '读取 FUTBIN 同分最低价…'; data = await events.highValueBaselines(scope.platform, signal); check();
             await reconcile(); await readActive();
             status.textContent = '读取俱乐部全部球员…';
             const inventory = await events.highValueInventory(check, request), candidates = inventory.filter(FsuHighValue.tradable);
-            const getPrice = events.highValuePrices(scope.platform, check), rows = [];
+            const priceCandidates = candidates.filter(item => !FsuHighValue.protection(item, locked(), active)
+                && data.platforms[scope.platform][Math.max(81, item.rating)]);
+            const getPrice = events.highValuePrices(scope.platform, check, { items: priceCandidates, signal,
+                onProgress: (rating, page) => { status.textContent = `正在读取 ${rating} 分报价，第 ${page} 页；同分球员共用结果…`; } }), rows = [];
             for (let i = 0; i < candidates.length; i++) {
                 check(); status.textContent = `正在查价 ${i + 1} / ${candidates.length}，随后自动移入…`;
                 const item = candidates[i];
@@ -202,7 +253,7 @@ events.highValueOpen = async () => {
                     if (!FsuHighValue.tradable(item) || FsuHighValue.protection(item, locked(), active)) throw new Error('球员保护状态已改变，请重新点击一键添加。');
                     GM_setValue(recordKey(), JSON.stringify({ id: String(item.id), definitionId: Number(item.definitionId) }));
                     return services.Item.move([item], ItemPile.TRANSFER);
-                });
+                }, true);
                 current = await transfers();
                 const confirmed = current.some(card => String(card.id) === String(item.id) && Number(card.definitionId) === Number(item.definitionId));
                 if (!confirmed) throw new Error('移卡结果未能确认，请核对转会列表；已停止后续移卡。');
@@ -215,6 +266,7 @@ events.highValueOpen = async () => {
         link.hidden = !/FUTBIN/.test(error.message);
     } finally {
         if (acquired) info.run.highValue = false;
-        stop.hidden = true;
+        if (stopped) panel.remove();
+        else { stop.textContent = '关闭'; stop.onclick = () => panel.remove(); }
     }
 };

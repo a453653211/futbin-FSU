@@ -4,7 +4,7 @@ const vm = require('node:vm');
 const acorn = require('acorn');
 const { functions, read } = require('./helpers.cjs');
 const source = read(require('../release.json').fodder.file);
-const names = ['installFodderPublicBridge', 'patchFodderBuyRun', 'patchFodderLatestBridge', 'parsePlayer', 'mergeRosters', 'checkVariantIds'];
+const names = ['installFodderPublicBridge', 'patchFodderBuyRun', 'patchFodderLatestBridge', 'patchFodderGalleryBridge', 'galleryMarketable', 'parsePlayer', 'mergeRosters', 'checkVariantIds'];
 const code = Object.values(functions(source, names)).join('\n');
 function setup(window = {}) {
     const ctx = { window, URL, Set, Map, Date, console, GM_xmlhttpRequest: () => { throw new Error('No live requests permitted'); },
@@ -45,4 +45,41 @@ test('Fodder adapter fails on unknown/duplicate factory or missing risk confirma
     assert.throws(() => c.patchFodderBuyRun('function unknown(){}', acorn), /未识别/);
     assert.throws(() => c.patchFodderBuyRun(core + core, acorn), /未识别/);
     assert.throws(() => c.patchFodderLatestBridge(patch.source.replace('buy.riskTitle', 'changed'), acorn, patch.adapter), /风险确认/);
+});
+test('Gallery adapter binds only one verified native loader and quote path, with no guessed API fallback', () => {
+    const c = setup(), core = read('test/fixtures/fodder-core.js');
+    const patched = c.patchFodderGalleryBridge(core, acorn).source;
+    assert.doesNotThrow(() => new vm.Script(patched));
+    assert.throws(() => c.patchFodderGalleryBridge(core + core, acorn), /唯一匹配/);
+    assert.throws(() => c.patchFodderGalleryBridge(core.replace('/api/gallery/', '/changed/'), acorn), /唯一匹配/);
+    assert.throws(() => c.patchFodderGalleryBridge(core.replace('prices = await galleryPrices(ids)', 'console.log(ids)'), acorn), /报价接口/);
+    assert.throws(() => c.patchFodderGalleryBridge(patched, acorn), /唯一匹配/);
+});
+test('Gallery bridge validates category/set identity and refreshes only explicit version/platform quotes', async () => {
+    const c = setup();
+    c.window.window = c.window; c.document = { createElement: () => ({ append() {} }), body: { append() {} } };
+    vm.runInContext(c.patchFodderGalleryBridge(read('test/fixtures/fodder-core.js'), acorn).source, c);
+    const bridge = c.window.__fodderGalleryBridge;
+    const a = await bridge.load('clubs', 'team-a'), b = await bridge.load('other', 'team-a');
+    assert.equal(a.cards[0].id, 9101); assert.equal(a.cards[0].collected, true); assert.equal(b.cards[0].id, 9107);
+    await assert.rejects(bridge.load('unknown', 'team-a'), /唯一匹配/);
+    await assert.rejects(bridge.prices([0], 'PC'), /参数无效/);
+    await assert.rejects(bridge.prices([9101], 'unknown'), /参数无效/);
+    c.window.__fodder.priceCache = { 'pc:9101': 500, 'console:9101': 600, 'pc:9102': 700 };
+    await bridge.prices([9101], 'PC');
+    assert.deepEqual(c.window.__fodder.priceCache, { 'console:9101': 600, 'pc:9102': 700 });
+    assert.equal(c.window.__mockGalleryQuotes.at(-1).platform, 'pc');
+    assert.equal(a.cards[0].collected, true, 'free buying must not reset historical collection state');
+});
+test('Gallery exact quotes remain selectable without EA concept listing limits; explicit invalid limits and missing quotes stay blocked', () => {
+    const { galleryMarketable } = setup();
+    for (const item of [{ getPriceLimits: () => null }, {}, { getPriceLimits: () => ({}) },
+        { getPriceLimits: () => { throw new Error('listing limits not loaded'); } },
+        { getPriceLimits: () => ({ minimum: 150, maximum: 100000 }) }]) {
+        assert.equal(galleryMarketable(item, 33750), true);
+        for (const quote of [0, -1, null, undefined, Infinity, NaN]) assert.equal(galleryMarketable(item, quote), false);
+    }
+    assert.equal(galleryMarketable(null, 33750), false, 'a quote alone cannot substitute for the exact EA concept card');
+    for (const range of [{ minimum: 0, maximum: 0 }, { minimum: 150, maximum: 100 }, { minimum: NaN, maximum: 10000 }])
+        assert.equal(galleryMarketable({ getPriceLimits: () => range }, 33750), false);
 });

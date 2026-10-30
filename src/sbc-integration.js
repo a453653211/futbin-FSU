@@ -1,5 +1,73 @@
 /* Runs inside FSU's futweb closure. Uses its existing EA entities and exclusion settings. */
 
+// Cards can change without viewDidAppear (smart fill, group save or manual replacement).
+// Keep FSU's own quote/cache and precious-card styling; request only newly visible versions.
+if (typeof UTPlayerItemView !== 'undefined') {
+    const renderItem = UTPlayerItemView.prototype.renderItem;
+    const renders = new WeakMap(), queued = new Map(), pending = new Map();
+    let timer;
+    GM_addStyle(`
+        .ut-squad-pitch-view.sbc .ut-squad-slot-view:has(.fsu-PriceBar.fsu-price-ready) .fodder-gg-item-price,
+        .ut-squad-slot-dock-view.sbc .ut-squad-slot-view:has(.fsu-PriceBar.fsu-price-ready) .fodder-gg-item-price,
+        .ut-squad-slot-dock-view.sbc .player:has(> .fsu-PriceBar.fsu-price-ready) > .fodder-gg-item-price {
+            display: none !important;
+        }
+    `);
+    const flush = () => {
+        timer = null;
+        const batch = Array.from(queued.values()); queued.clear();
+        const job = Promise.resolve().then(() => events.loadPlayerInfo(batch.map(entry => entry.player)))
+            .catch(error => console.warn('[FSU SBC 价格]', error));
+        for (const entry of batch) pending.set(entry.player.definitionId, job);
+        job.then(() => {
+            for (const entry of batch) {
+                pending.delete(entry.player.definitionId);
+                entry.paint.forEach(paint => paint());
+            }
+        });
+    };
+    UTPlayerItemView.prototype.renderItem = function (player, ...args) {
+        const token = {}; renders.set(this, token);
+        const result = renderItem.call(this, player, ...args);
+        const root = this.__root;
+        if (!player?.isValid() || !player.isPlayer() || !root) return result;
+        // The upstream renderer creates its card extras in a 10 ms task. Run after it.
+        setTimeout(() => {
+            const current = () => renders.get(this) === token && this.__root === root && root.isConnected &&
+                !!root.closest('.ut-squad-pitch-view.sbc, .ut-squad-slot-dock-view.sbc') &&
+                Number(root.querySelector('span[p-id]')?.getAttribute('p-id')) === Number(player.id || player.definitionId);
+            if (!current()) return;
+            const paint = () => {
+                if (!current() || !info.set.card_price) return;
+                const bar = this._fsu?.price, item = this._fsu?.priceItem;
+                if (!bar || !item) return;
+                // A reused view may retain a price node outside the current card root.
+                root.prepend(bar);
+                root.querySelectorAll('.fsu-PriceBar').forEach(node => { if (node !== bar) node.remove(); });
+                const cached = events.getCachePrice(player.definitionId, 3);
+                const price = events.getCachePrice(player.definitionId, 1);
+                const ready = cached && (price.num > 0 || price.type !== 0);
+                bar.classList.toggle('fsu-price-ready', ready);
+                item.setAttribute('data-show', ready ? '1' : '0');
+                if (!cached) return;
+                item.querySelector('.fsu-PriceValue').textContent = price.text;
+                const type = item.querySelector('.fsu-PriceType');
+                type.textContent = info.priceType[price.type];
+                type.setAttribute('data-content', info.priceType[price.type]);
+                item.classList.toggle('precious', ready && events.isPrecious(player.rating, player.rareflag, price.num, price.type));
+            };
+            paint();
+            if (!info.set.card_price || events.getCachePrice(player.definitionId, 3)) return;
+            const running = pending.get(player.definitionId);
+            if (running) { running.then(paint); return; }
+            const entry = queued.get(player.definitionId) || { player, paint: [] };
+            entry.paint.push(paint); queued.set(player.definitionId, entry);
+            if (!timer) timer = setTimeout(flush, 0);
+        }, 10);
+        return result;
+    };
+}
+
 events.smartSbcCheckIdle = (allowHighValue = false) => {
     const page = typeof unsafeWindow === 'undefined' ? {} : unsafeWindow;
     const retry = page.__fodderGalleryRetry5m?.status();
